@@ -2,24 +2,20 @@
 
 ## 题面
 
-邮件系统切到 IDLE 推送后，移动端用户大面积反馈漏信：会话停留在旧 UIDVALIDITY 上，邮箱重建后仍按旧序号推送 EXISTS；同一封新邮件在分页拉取时被重复下发；一次返回几百条通知把客户端打挂；两个账号使用同名 INBOX，A 账号的变更出现在 B 的连接上；会话已经结束 IDLE，服务端仍往里塞通知；MODSEQ 回退的更新覆盖了较新的邮箱快照；邮件数从 5 降到 4 被当作正常更新；连接闲置超时后仍能继续 Poll；重启后待推送队列和游标全部丢失，客户端只能全量重同步；异常客户端把会话数占满，正常用户再也建不了连接。现在重建这条推送链路，范围是模块 gsb/batch46-safety-d-03 的 imap_idle_guard.go、类型 ImapIdleGuard，任务类型 Bugfix。
+办公网递归解析器换上新检测插件，第二天两类工单同时爆：公司 CDN 域名因子域带长哈希被误封，安全组却发现一台终端一天发二十多万条 TXT 查询、插件零告警。日志显示，白名单 good.com 把 notgood.com 和 good.com.evil.net 一起放过；超长 base32 子域只在首个标签超过 30 字符时告警；同域名重复查询把唯一子域计数刷过阈值，正常业务被误杀；滑动窗口不按时间淘汰，昨天的查询今天还在算分；被封客户端换一个大小写不同的域名继续查；封禁写错后永不解封；截断响应和 SERVFAIL 也被计入统计；告警列表跑一天吃掉两 G 内存；乱序补发日志导致窗口前后算错；进程重启后白名单与封禁全部丢失；查询没见过的客户端直接抛 KeyError。
 
-保留现有导出错误值与状态、通知类型常量，关键入口：NewImapIdleGuard(policy Policy) *ImapIdleGuard；NewImapIdleGuardFromSnapshot(policy Policy, data []byte) (*ImapIdleGuard, error)；SetMailbox(account string, m Mailbox) error；Mailbox(account, name string) (Mailbox, error)；RegisterSession(account, sessionID, mailbox string, now time.Time) (IdleSession, error)；BeginIdle(sessionID string, now time.Time) error；EndIdle(sessionID string) error；Publish(u Update, now time.Time) error；Poll(sessionID string, now time.Time) ([]Notification, error)；CloseSession(sessionID string) error；SessionsFor(account string) []string；Snapshot() ([]byte, error)；Counters() Stats。
+范围是 gsb/batch46-safety-d-03 下的 dns_tunnel_guard.py，类 DnsTunnelGuard，任务类型 Bugfix，负责白名单、按客户端的滑动窗口特征、打分、封禁与快照。公开接口（Python 类型注解）：`DnsTunnelGuard(*, window: int = 60, unique_threshold: int = 20, label_threshold: int = 30, max_events: int = 500, block_seconds: int = 300, max_alerts: int = 200, public_suffixes: tuple = DEFAULT_SUFFIXES)`；`allow_domain(domain: str, *, note: str = "") -> dict`；`revoke_domain(domain: str) -> None`；`base_domain(qname: str) -> str`；`ingest(event: dict, *, now: int | None = None) -> dict`；`ingest_batch(events: list, *, now: int | None = None) -> list`；`client_state(client: str, *, now: int | None = None) -> dict`；`alerts(*, client: str | None = None, limit: int | None = None) -> list`；`block_client(client: str, seconds: int, *, now: int | None = None) -> dict`；`unblock_client(client: str) -> dict`；`blocked(*, now: int | None = None) -> list`；`expire(now: int) -> list`；`snapshot() -> dict`；`restore(snapshot: dict) -> None`。配置与入参错误抛 DnsTunnelError(code, detail)，单条事件问题用返回值表达。
 
-邮箱与更新要求：邮箱名、UIDVALIDITY、消息数、MODSEQ 任一非法返回 ErrMailboxInvalid；未登记邮箱返回 ErrMailboxNotFound；Publish 的账号与邮箱必须已登记；MODSEQ 必须严格递增，相等或更旧返回 ErrStaleUpdate 且邮箱快照不变；UIDVALIDITY 不变的邮件数回退返回 ErrStaleUpdate，UIDVALIDITY 变化时允许计数变小并把会话游标重置到新计数。
+故障与边界：一、allow_domain 先转小写并去掉末尾点，非法域名抛 DNS_BAD_DOMAIN，首次返回含 domain、note、status 的字典，status 为 allowed，重复添加返回 unchanged；revoke_domain 撤销不存在的域名抛 DNS_UNKNOWN_DOMAIN。二、白名单按标签边界匹配，qname 等于域名或以 “.” 加域名结尾才算命中，返回 allow + DNS_ALLOWLISTED、score 为 0、reasons 为空且不写入窗口；notgood.com 与 good.com.evil.net 不算命中。三、ingest 的 client 必须非空，否则抛 DNS_BAD_CLIENT；qname 归一化为小写去尾点后必须至少两个标签、总长不超过 253、每个标签 1 到 63 字符、只含字母数字下划线和连字符，否则返回 drop + DNS_BAD_QNAME、score 为 0 且不建客户端状态；base_domain 用 public_suffixes 做最长后缀匹配，a.b.example.co.uk 得到 example.co.uk，没有命中时退化为最后两个标签。四、打分固定四项：任一标签长度超过 label_threshold 记 LONG_LABEL 加 40；qtype 为 TXT 或 NULL 记 SUSPICIOUS_QTYPE 加 25；同一客户端同一 base_domain 在窗口内唯一 qname 数达到 unique_threshold 记 HIGH_UNIQUE 加 25；size 大于等于 400 记 LARGE_RESPONSE 加 10；总分封顶 100，reasons 按此固定顺序输出。五、唯一 qname 按归一化完整域名去重，重复查询只算一个；统计按客户端加 base_domain 隔离。六、窗口以当前事件 now 为基准，ts 小于等于 now 减 window 的事件先淘汰再打分；max_events 是每个客户端保留上限，超出丢最旧；client_state 返回 events、unique、base_domains、recent、blocked_until，recent 按时间升序给 qname，未见过的客户端返回全零状态而不是抛异常。七、总分达到 80 返回 block + DNS_BLOCKED 并封禁 block_seconds 秒，达到 40 返回 alert + DNS_ALERT，其余返回 allow + DNS_ALLOWED；触发封禁的事件仍按打分记录。八、封禁中的客户端直接返回 block + DNS_CLIENT_BLOCKED、score 为 0，不再解析 qname；封禁截止时间小于等于 now 时自动解除，blocked(now) 按字典序返回封禁中客户端。九、block_client 的 seconds 必须大于 0，否则抛 DNS_BAD_BLOCK，返回 {"client","until","status"}；unblock_client 解封并返回 status 为 unblocked；expire(now) 清理并返回到期客户端列表，按字典序排列。十、rcode 不为 0 返回 allow + DNS_RCODE_IGNORED，truncated 为真返回 allow + DNS_TRUNCATED，两者都不写入窗口；ingest_batch 忽略传入顺序，按 ts 升序逐条处理并返回同序结果。十一、告警记录含 client、qname、score、reasons、ts、action，按发生顺序追加，超过 max_alerts 丢最旧；alerts(client) 只返回该客户端，limit 取最近 limit 条但仍按时间升序。十二、snapshot 带 version=1，覆盖白名单、每个客户端的窗口事件与封禁截止时间、告警列表，必须深拷贝；restore 校验版本与字段类型，非法抛 DNS_SNAPSHOT_CORRUPT 且原状态不变。
 
-会话要求：重复会话号、会话数超过 MaxSessions、在 active 状态 Poll、重复 BeginIdle、EndIdle 后 Poll 都返回 ErrSessionState 或 ErrSessionLimit；注册会话时游标取当前邮箱的消息数与 MODSEQ；Poll 只能在 idle 状态使用，按发布顺序返回至多 BatchSize 条，通知带 Kind、Value、ModSeq 三个字段，返回后游标前进，再次 Poll 不重复投递；UIDVALIDITY 变化只下发一条 UIDVALIDITY 通知并以新计数重置游标，不补发旧代 EXISTS；通知按账号和邮箱双重隔离，同名邮箱在不同账号之间不得串消息。
+硬约束：ingest、ingest_batch、expire、block_client 与 restore 全程持锁；多线程并发写同一客户端时事件数不得超过 max_events，unique 不能重复或丢失；每个客户端的窗口与告警列表分别受 max_events 和 max_alerts 约束，不随查询量线性膨胀；快照恢复后封禁客户端继续被拦，已到期封禁不得复活。
 
-资源与恢复：每个会话的待推送队列受 MaxPending 限制，超出时丢弃最旧的通知并累加 Dropped；idle 时间超过 IdleTimeout 的会话在 Poll 时返回 ErrIdleTimeout、状态转为 closed、累加 Expired，之后再次 Poll 返回 ErrSessionState；CloseSession 释放会话名额，关闭后操作返回 ErrSessionNotFound。并发向不同邮箱发布不得丢通知或串号。Snapshot 必须保存邮箱、会话游标、待推送队列和计数器，恢复后未送达的通知继续按原顺序下发，计数器延续；损坏快照返回 ErrSnapshot。
-
-补充要求：Mailbox 与 SessionsFor 返回副本，调用方修改返回值不得影响内部状态；SetMailbox 对同一账号的同名邮箱是覆盖登记，用于进程启动时装载状态；SessionsFor 的结果按会话号升序；Seq 返回最近一次已投递的消息总数，未投递的通知不影响它；MaxSessions 为 0 表示不限制；Counters 的 Published、Delivered、Dropped、Expired、Rejected 分别对应成功发布、已投递、队列丢弃、超时关闭和被拒绝的更新。
-
-验收：go test ./... 的 15 条测试全部通过；不得修改或跳过测试、不得按固定输入硬编码；并发与重启场景自行验证；只做本地实现。
+验收：`python3 -m pytest -q tests` 的 15 条测试全部通过；不得修改测试、跳过或按固定输入写死；并发与重启恢复场景自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
