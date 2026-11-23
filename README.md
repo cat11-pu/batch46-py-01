@@ -2,33 +2,20 @@
 
 ## 题面
 
-上周城域接入网割接后，运维在夜间告警里发现两件事：部分政企客户的 CPE 连续拿到别家租户的前缀，还有一台没有登记过的委派路由器在链路里下发地址，接入侧的前缀委派防护一条都没拦住。现在要把这块防护补齐，范围是模块 `gsb/batch46-safety-c-01`、源文件 `dhcpv6_guard.go`、类型 `Dhcpv6Guard`，任务类型 Bugfix，骨架里已有的方法签名保持不变。
+区域出口上个月把 FlowSpec 引流从观察切到自动执行，三小时里骨干被打挂两次。客户侧路由器通告 0.0.0.0/0 的 discard，边界把全部上行流量丢掉；同一邻居重复通告同一条规则，表里堆了七百多条相同表项；同前缀两条不同优先级的规则实际生效的是低优先级那条；customer 把不属于自己的 /16 塞进来照样落表；redirect 下一跳写成公网地址，流量被整段引走；一条规则塞十二个组件让解析线程抛异常；端口范围写成 443-80 没人拦；运维按 rule_id 撤规则找不到只能重启；滚动重启后规则表清空；单对端一分钟推两千条规则把内存打满；被拉黑的对端仍能继续注入；TTL 到期的规则还在参与匹配。
 
-对外接口：`AddServer(duid, tenantID string) error` 登记可信委派路由器；`RevokeServer(duid string) error` 吊销；`AddPool(cidr string) error` 登记可下发地址池；`Screen(adv Advertise, now time.Time) (Offer, error)` 校验 Advertise 并生成待提交的 Offer；`Commit(offerID string, now time.Time) (Lease, error)` 把 Offer 落成租约；`LeaseFor(clientDUID string, iaid uint32) (Lease, bool)` 查租约；`Release(clientDUID string, iaid uint32, now time.Time) error` 释放；`Expire(now time.Time) int` 清理到期数据；`Stats() Stats` 看占用；`Snapshot() ([]byte, error)` 与 `NewDhcpv6GuardFromSnapshot(cfg Config, data []byte) (*Dhcpv6Guard, error)` 负责快照恢复。
+范围是 gsb/batch46-safety-c-01 下的 bgp_flowspec_guard.py，类 FlowspecGuard，任务类型 Bugfix，负责对端注册、规则校验、冲突裁决、限速与快照。公开接口（Python 类型注解）：`FlowspecGuard(*, max_rules: int = 256, max_components: int = 8, rate_limit: int = 20, rate_window: int = 60, violation_threshold: int = 3, block_seconds: int = 300, allowed_next_hops: tuple = ())`；`register_peer(peer: str, *, role: str, asn: int, prefixes: tuple = ()) -> dict`；`ingest(rule: dict, *, peer: str, now: int | None = None) -> dict`；`ingest_batch(rules: list, *, peer: str, now: int | None = None) -> list`；`rules(*, peer: str | None = None, now: int | None = None) -> list`；`effective(destination: str, *, now: int | None = None) -> list`；`withdraw(rule_id: str) -> dict`；`stats(peer: str | None = None) -> dict`；`block_peer(peer: str, seconds: int, *, now: int | None = None) -> dict`；`release_peer(peer: str) -> dict`；`blocked(*, now: int | None = None) -> list`；`expire(now: int) -> list`；`snapshot() -> dict`；`restore(snapshot: dict) -> None`。注册类错误抛 FlowspecError(code, detail)，规则类问题用返回值表达。
 
-需要逐条落地的行为：
+故障与边界：一、role 只接受 edge/customer/upstream/untrusted，否则抛 FSP_BAD_ROLE；asn 不在 1 到 4294967295 之间抛 FSP_BAD_ASN；prefixes 非法抛 FSP_BAD_PREFIX；同一对端内容一致重复注册返回 status 为 unchanged，内容不同抛 FSP_PEER_CONFLICT；注册成功返回含 peer、role、asn、prefixes、status 的字典。二、ingest 返回 {"action","code","peer","rule_id","priority"}，action 取 accept、duplicate、rejected、rate_limited、blocked；成功 code 为 FSP_ACCEPTED，替换旧规则为 FSP_REPLACED。三、未注册对端返回 FSP_PEER_UNKNOWN；untrusted 与 upstream 一律 FSP_PEER_DENIED；customer 只能注入 owned 前缀本身或其子网，超网与外前缀返回 FSP_PREFIX_NOT_OWNED。四、destination 必填且可解析，缺失或类型不对返回 FSP_BAD_RULE，解析失败返回 FSP_BAD_PREFIX；IPv4 与 IPv6 都要支持。五、匹配组件只允许 destination/source/protocol/port/tcp_flags/packet_length/dscp/icmp_type，未知键返回 FSP_BAD_COMPONENT，总数超过 max_components 返回 FSP_TOO_MANY_COMPONENTS；端口倒序或越界返回 FSP_BAD_PORT_RANGE；protocol 越界与非法 tcp_flags 返回 FSP_BAD_RULE。六、action 只允许 discard/rate-limit/redirect；redirect 必须带 allowed_next_hops 内的 next_hop，缺失或多带返回 FSP_BAD_ACTION，不在白名单返回 FSP_NEXT_HOP_DENIED。七、同一对端归一化匹配完全相同的规则只留一条，第二次返回 duplicate + FSP_DUPLICATE，rule_id 相同且不重复计数；不同对端的相同规则各自成立且 rule_id 不同。八、同一匹配键按 priority 数值小者胜；新规则优先级更大或相等返回 rejected + FSP_CONFLICT，更小则替换旧规则并返回 FSP_REPLACED。九、规则数达到 max_rules 后新增匹配键返回 FSP_CAPACITY；替换已有匹配键不受上限影响。十、rate_window 秒内成功接纳超过 rate_limit 条后多出的返回 rate_limited + FSP_RATE_LIMIT；限速违规计入违规，窗口内违规达到 violation_threshold 立即封禁 block_seconds 秒，触发封禁的那条仍返回原结果，之后返回 blocked + FSP_PEER_BLOCKED，到期自动恢复；block_peer 直接封禁，release_peer 立即解封，blocked(now) 按字典序返回封禁中对端；stats 返回 accepted、rejected、rate_limited、duplicates、active、blocked，peer 为空时返回聚合值并附 peers 计数。十一、rules 每行含 rule_id、destination、priority、action、expires_at，按 (priority,destination,rule_id) 升序；effective 只返回覆盖该地址且未过期的规则，按前缀长度降序、priority 升序、rule_id 升序排列，跨地址族返回空列表；ttl 从注入时刻起算，expire(now) 删除 expires_at 小于等于 now 的规则并按 rule_id 升序返回。十二、withdraw 未知 rule_id 抛 FSP_UNKNOWN_RULE，成功后该匹配键可重新注入；snapshot 含 version、peers、rules、stats、blocked，version 为 1，覆盖对端、规则、计数与封禁截止时间，必须深拷贝；restore 校验版本与结构，非法抛 FSP_SNAPSHOT_CORRUPT 且原状态不变。
 
-1. 未登记的 server 发来的 Advertise 必须返回 `ErrServer`；已登记但被 `RevokeServer` 吊销的 server 同样按不可信处理，不能因为租约还在就继续放行。
-2. 前缀长度必须落在 `MinPrefixLen` 与 `MaxPrefixLen` 之间（含端点，配置是 48 到 64），越界返回 `ErrPrefixLen`，不允许截断后照发；长度合法但不在任何 `AddPool` 池内的前缀返回 `ErrPool`，比池更大的前缀（池是 /48、报到 /40）也属于池外。
-3. 广告里的 `TenantID` 必须等于服务器登记时的租户，不一致或为空返回 `ErrTenant`。
-4. `ValidLifetime` 为 0、`PreferredLifetime` 为负或大于 `ValidLifetime` 都返回 `ErrLifetime`，不要静默纠正成合法值。
-5. 同一 server 对同一 `(clientDUID, IAID)` 在 `AdvertiseInterval` 内重复下发要返回 `ErrRate`，超过间隔后重新放行；限速表按 server 和客户端分别记，不要一个客户端把同一 server 的其他客户端连带限死。
-6. `Commit` 出来的租约带 T1 = 租期一半、T2 = 租期 80%，租期取广告 `ValidLifetime` 与 `LeaseTTL` 的较小值；`ExpiresAt`、T1、T2 要能原样从 `LeaseFor` 读回。
-7. 同一 `(clientDUID, IAID)` 重复提交同一个 Offer 必须幂等：返回原租约、不延长到期时间、租约计数不增加；同一 IA_PD 换另一个前缀提交则返回 `ErrBound`。
-8. 与任何活动租约前缀重叠的新租约返回 `ErrConflict`，被包含的更具体前缀（例如 /57 落在活动 /56 里）也算重叠；`Release` 或 `Expire` 之后同一前缀才允许重新分配。
-9. 每租户活动租约数达到 `MaxLeasesPerTenant` 时，新客户提交返回 `ErrQuota`；这条失败的提交不能消耗 Offer、不能留下占位，`Release` 出一个名额后同一个 Offer 仍要能提交成功。
-10. 未知的 offerID、或已过 `OfferTTL` 的 Offer 返回 `ErrNoOffer`；所有失败路径都不允许留下半个租约、改坏已有租约或把已提交的 Offer 算两次。
-11. `Expire(now)` 只清理到期的租约和 Offer 并返回清掉的租约数，提前调用返回 0；被清掉的租约 `LeaseFor` 必须查不到，`Release` 一个不存在的租约返回 `ErrNoLease`。
-12. 空 `clientDUID`、无法解析的前缀等非法输入返回 `ErrInvalid`，不要 panic。
+硬约束：ingest、ingest_batch、withdraw、expire 与 restore 全程持锁；并发注入下规则数不得超过 max_rules，accepted 必须等于成功落表次数，不能重复计数或丢计数；规则表、限速窗口与封禁表都有界，不随报文数量膨胀；快照恢复后的封禁继续生效，已过期的封禁不得复活。
 
-硬约束：并发提交必须原子，两个客户端同时提交互相重叠的前缀时恰好一个成功、另一个拿 `ErrConflict`，租约表与限速表在并发下不能重复分配；快照要带上可信服务器（含吊销状态）、地址池、活动租约及其 T1/T2 与到期时间，进程重启恢复后继续拒绝重叠和重复提交，`Stats` 计数与重启前一致；重复提交与失败回滚必须幂等，任何一次失败都不能改变已有租约或占用名额。
-
-验收：`go test ./...` 的 15 条测试必须全过；不得修改测试、跳过或用固定输入写死；并发与重启场景自行写验证程序确认；只在本地实现，不需要对接真实 DHCPv6 设备。
+验收：`python3 -m pytest -q tests` 的 15 条测试全部通过；不得修改测试、跳过或按固定输入写死；并发与重启恢复场景自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
