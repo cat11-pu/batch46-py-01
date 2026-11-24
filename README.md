@@ -2,46 +2,18 @@
 
 ## 题面
 
-接入层凌晨报警：四层转发节点把真实客户端 IP 记成了上一跳负载均衡器的地址，审计里同一秒出现两个来源的“同一连接”，限流规则随后被整段绕过。抓包回放把这批事故归到 PROXY protocol 头：不可信网段自带的头被直接采信，v2 的 TLV 任意透传，多级代理串联的链路也没有任何上限，重启后已放行的连接又全部丢失。值班同学先回滚了转发配置，但根因还在，任何一条新建连接都可能被伪造头带偏。
+上周三凌晨，边缘网关切到新的四层负载均衡后，风控发现一批请求的客户端地址全变成公网出口 IP，真实来源在日志里消失；同一天又有人绕过负载均衡直连业务端口，自己拼了一段 PROXY 头，把会话挂到别人的内网地址上。值班同学临时把头部信任开关关掉，结果正常玩家也登不进来，客服工单堆到两百多张，监控面板上内网来源占比从九成掉到不足一成。请修 `gsb/batch46-safety-c-06` 里的 `proxy_protocol_guard.py`，核心类型 `ProxyProtocolGuard`，任务类型 Bugfix。所有校验失败必须抛出 `ProxyProtocolError(code, detail=None)`，调用方按 `code` 分支处理。
 
-请修复 gsb/batch46-safety-c-06 中 proxy_protocol_guard.go 的 ProxyProtocolGuard，任务类型 Bugfix，只改本地实现。
+需要保留这些公开方法：`__init__(self, *, trusted_peers: Iterable[str] = (), max_header_bytes: int = 536, max_tlv_bytes: int = 256, max_connections: int = 1024, source_ttl: float = 5.0) -> None`、`allow_peer(self, peer: str) -> None`、`revoke_peer(self, peer: str) -> None`、`is_trusted(self, peer: str) -> bool`、`parse(self, raw: bytes, *, peer: str, connection: str | None = None, now: float = 0.0) -> dict`、`trust_source(self, source_ip: str, *, now: float, ttl: float | None = None) -> dict`、`check_source(self, source_ip: str, *, now: float) -> bool`、`purge_sources(self, *, now: float) -> int`、`stats(self) -> dict`、`recent(self, limit: int = 10) -> list[dict]`、`snapshot(self) -> dict`、`restore(self, state: dict) -> None`。
 
-需要遵守的公开接口（签名不得改动）：
+具体故障与边界：一、不受信的 peer 必须在看头之前拒绝，报 `PPX_UNTRUSTED_PEER`；`allow_peer` 同时支持单个 IP 和 CIDR，非法 peer 报 `PPX_BAD_PEER`，`revoke_peer` 只移除对应网段。二、v1 只认 `PROXY TCP4`、`PROXY TCP6` 和 `PROXY UNKNOWN`，其它协议令牌报 `PPX_BAD_PROTOCOL`，地址或端口非法报 `PPX_BAD_ADDRESS`，端口必须在 1 到 65535 之间，整行超过 `max_header_bytes` 报 `PPX_TOO_LARGE`，找不到 CRLF 报 `PPX_TRUNCATED`，CRLF 之后还有多余字节报 `PPX_TRAILING_DATA`。三、v2 的 12 字节签名不符报 `PPX_BAD_SIGNATURE`，版本不是 2 报 `PPX_BAD_VERSION`，命令不是 LOCAL/PROXY 报 `PPX_BAD_COMMAND`，地址族不是 0x00/0x11/0x21 报 `PPX_BAD_FAMILY`，声明长度与实际 body 不一致报 `PPX_LENGTH_MISMATCH`；TCP4 与 TCP6 的地址版本必须与族匹配，PROXY 命令下 family 0x00 表示不带地址。四、TLV 只允许 0x01 ALPN、0x02 AUTHORITY、0x03 UNIQUE_ID、0x04 SSL，长度上限依次 32/128/64/64，未知类型报 `PPX_TLV_TYPE`，超长报 `PPX_TLV_LEN`，重复报 `PPX_TLV_DUP`，TLV 总字节超过 `max_tlv_bytes` 报 `PPX_TLV_TOO_LARGE`，截断报 `PPX_TLV_TRUNCATED`。五、成功时 code 为 None，结果固定含 status、code、version、command、source、destination、tlvs、header_bytes；source/destination 是 `(ip, port)` 或 None，UNKNOWN 与 LOCAL 不带地址，v2 的 header_bytes 是整段输入长度；ALPN/AUTHORITY/UNIQUE_ID 按 UTF-8 解码，SSL 返回十六进制字符串。六、同一 connection 再次携带头部报 `PPX_DUPLICATE`，被拒请求不占用连接记录，重复请求也不刷新该连接的最近使用顺序；连接表按最近使用受 `max_connections` 限制，表满时淘汰最久未用的连接并累加 evicted，被淘汰的连接可以重新建头。七、`trust_source` 返回 source_ip 与 expires_at，`check_source` 仅在 now 严格小于 expires_at 时为真，过期后 `purge_sources` 返回清理条数。八、`stats` 至少含 accepted、rejected、codes、connections、sources、recent、evicted，拒绝按 code 累计；`recent` 最多保留 100 条，按发生顺序，接受和拒绝都要记，拒绝记录带 code 和 peer。九、快照含 version、trusted_peers、connections、sources、counters、recent、evicted，`restore` 要深拷贝并整体替换现有状态，改快照不能影响原对象，版本不符报 `PPX_STATE_VERSION`。十、多个线程同时 `parse` 不同连接时，计数和 LRU 不能丢更新；`stats`、`snapshot` 与解析互斥。
 
-- NewProxyProtocolGuard(policy TrustPolicy) (*ProxyProtocolGuard, error)
-- NewProxyProtocolGuardFromSnapshot(policy TrustPolicy, data []byte) (*ProxyProtocolGuard, error)
-- (*ProxyProtocolGuard) Parse(raw []byte) (Header, error)
-- (*ProxyProtocolGuard) ParseChain(raw []byte) ([]Header, error)
-- (*ProxyProtocolGuard) TrustPeer(cidr string) error / UntrustPeer(cidr string) error / IsTrusted(addr string) bool
-- (*ProxyProtocolGuard) Admit(connID string, peer Peer, raw []byte, now time.Time) (Client, error)
-- (*ProxyProtocolGuard) Client(connID string) (Client, error) / CloseConn(connID string) error / ActiveConns() int
-- (*ProxyProtocolGuard) Snapshot() ([]byte, error) / Stats() Stats
-
-具体现象与边界：
-
-1. v1 的 TCP4 行要完整解出源目的地址与端口，Header 的 Version、Command、Family 以及四个地址端口字段都要填对，没有选项时 TLVs 为空 map；端口超过 65535、字段缺失、端口非数字一律 ErrMalformed，不能把残缺行当合法头。
-2. 不是 PROXY 头的字节（例如普通 HTTP 请求行）返回 ErrNotProxy；v2 的 12 字节签名被改动同样按 ErrNotProxy 处理。
-3. v2 必须校验版本、声明长度与地址块；声明长度大于实际字节返回 ErrMalformed；只支持 TCP4/TCP6，AF_UNIX 等返回 ErrUnknownFamily。
-4. v2 选项只允许策略里的类型（如 authority），未知类型返回 ErrTLVInvalid，不能静默透传给上层。
-5. 头长度超过 MaxHeaderBytes 时必须先返回 ErrHeaderTooLarge，不允许先做字段解析；上限按整条头（含 CRLF）计算，不能只量地址部分。
-6. peer 不在受信 CIDR 内返回 ErrUntrustedPeer，且不能占用连接表；TrustPeer/UntrustPeer 要立即影响后续判断，撤销后同地址再连必须被拒，策略初始 CIDR 为空表示默认谁都不信。
-7. 多级代理按“外层在前”拼接，客户端地址取最内层头的源地址；头数超过 MaxChainHops 返回 ErrLimit。
-8. 同一 connID 重复提交完全相同的链路要幂等：返回同一 Client，Stats 的 Idempotent 加一、Admitted 不重复加、Rejected 不增加；同 connID 出现不同链路返回 ErrBrokenChain。
-9. 两条不同链路并发抢占同一 connID，必须只有一个成功，另一个拿到 ErrBrokenChain，ActiveConns 保持 1。
-10. Client/CloseConn 对未知连接返回 ErrConnUnknown；CloseConn 之后 ActiveConns 立即下降。
-11. Snapshot 必须带走受信 CIDR 与已放行连接，经 NewProxyProtocolGuardFromSnapshot 恢复后 Client 仍能查到原地址、ActiveConns 不变，快照里不保存原始报文。
-12. 信任表与连接表的所有读写要互斥，不能出现“刚撤销的 CIDR 仍被放行”或计数错乱；连接关闭后决策立即从内存移除，重新建连要重新走一遍信任检查。
-
-硬约束：连接表的判定必须是原子事务，解析失败不得留下半条连接；快照恢复前后已放行的连接和信任集合要一致；单连接只保存一条链路决策，内存不随重放请求增长。
-
-验收：go test ./... 的 15 条测试全部通过；不得修改测试、跳过或用固定输入写死结果；并发与恢复场景自行验证；只做本地实现，不涉及上游提交。
-
-交付：修改后的源码与测试通过记录，附一段简要说明，讲清各错误码的触发顺序。
+硬约束：并发调用必须原子，计数器与 recent 的写入和解析在同一临界区内完成；快照恢复后连接去重、信任列表、计数和来源有效期要一致；v1 行、v2 TLV、连接表和 recent 各自有上限，先做总量校验再逐项解析，错误码必须稳定，不允许同类故障在不同分支里换成两个名字。验收标准是 `python3 -m pytest -q tests` 的 15 条全部通过；不得改测试、跳过或按固定输入写死，并发与重启恢复自行验证，只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -49,4 +21,4 @@ go test ./...
 - domain: 安全
 - sub: 网络与通信安全
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
