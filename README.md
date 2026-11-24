@@ -2,20 +2,20 @@
 
 ## 题面
 
-投影卷令牌出过一次越权：一个 Pod 的令牌被同命名空间的另一个 Pod 拿去访问 Vault，节点迁移后旧令牌还在用，轮换出的新令牌生效了但旧令牌同时还能过，Pod 删掉之后令牌一直有效，申请的 TTL 也被随手写成几小时。代码在模块 gsb/batch46-safety-a-10 的 k8s_bound_token_guard.go，类型 BoundTokenGuard，任务类型 Bugfix。集群规模已经到几千个 Pod，节点每周都在滚动替换，令牌的生命周期比 Pod 短，轮换和删除必须同时生效；审计要求任何一条令牌都能追溯到唯一的 Pod UID 与节点。采集端会周期性检查剩余寿命，太晚触发轮换会直接把业务打断，太早又会产生大量无谓的签发。
+多租户集群升级到投射服务账号令牌后，审计报出一串问题：给监控用的令牌 audience 只有 metrics，却能被 API Server 接受，跨服务调用没有隔离；标记了 pod UID 的令牌在别的 pod 里照样通过，节点绑定的令牌换台机器也能用；令牌过期时间比配置的 ttl 长出一大截，最长的一次签了十二小时；Refresh 接口在令牌刚签发十秒就把有效期续满，客户端因此从不真正轮换；同一个 UID 被并发签发两次，两把令牌内容不同却都进了令牌表；吊销某个服务账号之后，之前签出的令牌还在用，新签的也被误伤；密钥轮换后旧令牌瞬间全灭，滚动升级中的工作负载集体 401；令牌表只增不减，节点重启之后内存直接翻倍；快照恢复后吊销时间和密钥环丢了，已吊销账号又能通过；审计统计和实际签发数对不上，并发下 issued 少记。模块路径 gsb/batch46-safety-a-10，文件名 k8s_bound_token_guard.py，类名 BoundTokenGuard，任务类型 Bugfix。
 
-接口：NewBoundTokenGuard(cfg Config) *BoundTokenGuard、NewBoundTokenGuardFromSnapshot(cfg Config, data []byte) (*BoundTokenGuard, error)、RegisterServiceAccount(namespace, name string) error、RegisterPod(b PodBinding) error、RequestToken(req TokenRequest, now time.Time) (Token, error)、Validate(c Claims, requiredAudience, nodeName string, now time.Time) error、NeedsRefresh(podUID string, now time.Time) (bool, error)、TokenFor(podUID string) (Token, error)、Rotate(podUID string, now time.Time) (Token, error)、RevokePod(podUID string) int、ActiveTokens() int、Prune(now time.Time) int、Snapshot() ([]byte, error)。
+接口以骨架为准：issue(subject: str, *, audiences: Sequence[str], now: int, ttl: int = 600, pod: str | None = None, node: str | None = None, uid: str | None = None, not_before: int | None = None) -> dict；decode(token: str) -> dict；validate(token: str, *, now: int, audiences: Sequence[str] = (), pod: str | None = None, node: str | None = None) -> dict；refresh(token: str, *, now: int, ttl: int = 600) -> dict；revoke(subject: str, *, now: int) -> dict；rotate_key(*, now: int) -> dict；purge_expired(*, now: int) -> int；snapshot() -> dict；restore(state: Mapping[str, Any]) -> None；stats() -> dict。
 
-问题与边界：1）申请令牌要求 namespace、serviceAccount、audience、PodUID、PodName、NodeName 全部非空，否则 ErrMalformed；service account 未注册 ErrUnknownSA，注册类接口参数为空同样 ErrMalformed。2）绑定必须与注册的 Pod 完全一致（命名空间、Pod 名、节点），不一致 ErrBinding；重复注册同一绑定幂等，改绑到另一节点 ErrMalformed。3）audience 必须在 Audiences 里，否则 ErrAudience；校验时 requiredAudience 非空则必须出现在 claims.Audiences。4）TTL 小于 MinTTL 或大于 MaxTTL 返回 ErrLimit；每个 Pod 同时存活令牌数达到 MaxTokensPerPod 再申请 ErrLimit。5）令牌值与 JTI 相同，均为 64 位小写十六进制，每次签发唯一，ExpiresAt 等于 now 加 TTL。6）Validate 对签名无效 ErrSignature；Subject 必须是 system:serviceaccount:命名空间:名字，段数不对 ErrMalformed，账号未注册 ErrUnknownSA。7）时间上 now 晚于 exp 加 ClockSkew 返回 ErrExpired（正好等于边界仍有效），now 加 ClockSkew 早于 iat 返回 ErrNotYet。8）claims 的 PodUID、PodName、NodeName 必须与注册绑定一致，否则 ErrBinding；调用方给出 nodeName 且与 claims 不同也 ErrBinding，未给出则不校验节点。9）令牌被轮换、吊销或从未登记时 JTI 查不到，返回 ErrRevoked。10）Rotate 继承最新令牌的 TTL 与 audience，清掉该 Pod 全部旧令牌再签发一条，旧令牌立刻 ErrRevoked，ActiveTokens 保持 1；并发轮换后只能有一条令牌可校验，且各次返回值互不相同。11）RevokePod 删除该 Pod 全部令牌并返回数量，之后 RequestToken、TokenFor 返回 ErrRevoked，所有 claims 校验 ErrRevoked，重复吊销返回 0。12）NeedsRefresh 在 now 加 RefreshWindow 到达或超过 ExpiresAt 时为 true，未知 Pod 返回 ErrMalformed；TokenFor 返回最新令牌；Prune 删除过期令牌并返回数量，ActiveTokens 同步；Snapshot 保存账号、绑定、令牌与吊销位，重启后存活令牌仍可校验、被吊销 Pod 仍 ErrRevoked、Prune 仍生效；并发申请、轮换、校验必须安全。
+具体规则与边界。令牌是三段式紧凑串，头部含 alg 为 HS256、typ 为 JWT、kid 为当前密钥编号，载荷含 sub、aud、iat、nbf、exp、jti，以及可选 pod_uid 和 node，段用无填充 base64url，签名用 kid 对应密钥做 HMAC-SHA256。audiences 必须是非空字符串序列，去重排序后最多八项，为空抛 BoundTokenError 且 code 为 TOK_INVALID_AUDIENCE，超过八项返回 TOK_AUDIENCE_LIMIT；ttl 小于等于零返回 TOK_INVALID_LIFETIME，超过 max_token_lifetime 返回 TOK_LIFETIME_TOO_LONG；uid 已存在且未过期返回 TOK_DUPLICATE_UID；令牌表满时先清理 exp 小于等于 now 的记录，仍然满才返回 TOK_LIMIT。validate 按解析、签名、密钥退休、过期、生效时间、audience、pod、node、吊销的顺序判断：段数或编码错误返回 TOK_MALFORMED，签名不符返回 TOK_BAD_SIGNATURE，旧密钥超过退休时刻返回 TOK_KEY_RETIRED，now 大于等于 exp 返回 TOK_EXPIRED，nbf 大于 now 加 clock_skew 返回 TOK_NOT_YET_VALID，要求列表里任一 audience 不在令牌里返回 TOK_AUDIENCE_MISMATCH，给了 pod 而令牌 pod_uid 不一致或缺失返回 TOK_BOUND_OBJECT_MISMATCH，给了 node 而令牌 node 不一致或缺失返回 TOK_NODE_MISMATCH，subject 已被吊销且令牌 iat 小于等于吊销时刻返回 TOK_REVOKED。成功返回 TOK_OK 以及 sub、aud、exp、pod_uid、node、kid。revoke 记录吊销时刻并返回 subject、revoked_at、invalidated 三个字段，invalidated 是当前令牌表里该 subject 且 iat 不大于 now 的条数。rotate_key 生成下一个 kid，把上一个 kid 的退休时刻设为 now 加 key_grace，返回 new_kid、retired_kid、retired_at。refresh 只在令牌剩余生命期不超过原始生命期的两成时允许，否则返回 TOK_REFRESH_NOT_NEEDED；刷新后保留同一个 jti、同一个 pod 与 node 绑定，iat 和 nbf 取 now，exp 取 now 加 ttl，用当前密钥签名；ttl 越界按签发规则报错。purge_expired 删除 exp 小于等于 now 的令牌并返回条数。
 
-硬约束：轮换与吊销必须原子，同一 Pod 任何时刻只保留一条可用令牌；被拒的申请不能留下令牌或计数；令牌、绑定与吊销记录受 TTL 与 Prune 约束。节点回收是常态，令牌的节点归属一旦变化就必须重新签发，绝不能沿用旧值，Pod 重建同样要换新的 UID；所有拒绝都要能落到具体字段，值班同学拿到一条错误就能判断是绑定、受众、时间还是吊销问题。
+硬约束：同一 uid 的签发判定与写入必须原子，八路并发签发同一 uid 只能有一个成功、七个 TOK_DUPLICATE_UID，issued 只记一次；令牌表受 max_tokens 上限约束，不能靠无限增长兜底；snapshot 深拷贝密钥环、当前 kid、退休时刻、吊销表、令牌表和统计，restore 完整替换，恢复后快照时刻之前吊销的令牌仍然拒绝、快照之后对原对象的吊销不影响恢复结果。stats 至少包含 issued、validated、refreshed、rejected 四个计数。
 
-验收：go test ./... 的 15 条测试全部通过，不得修改测试、跳过或按固定输入写死；并发与重启场景自行验证；只做本地实现。
+验收：python3 -m pytest -q tests 的 15 条测试必须全部通过；不得修改测试、跳过或按固定输入写死；并发与快照恢复需要自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
