@@ -2,20 +2,18 @@
 
 ## 题面
 
-边缘网关最近把正常请求判成篡改、又把篡改请求放了过去：查询参数排序随遍历顺序乱跳，空格被编成加号，头名大小写不统一，同一个签名十分钟内能反复使用，预签名链接过期后仍能下载。问题集中在模块 gsb/batch46-safety-a-07 的 sigv4_canonical_guard.go，类型 SigV4Guard，任务类型 Bugfix。审计还要求所有被拒请求都能明确归因，不能把时钟问题报成签名问题。
+海外区对象存储的签名网关换成本地 SDK 后，跨天批量任务开始整批返回 403，同一批请求在巴黎节点能过、在弗吉尼亚节点全挂。排查发现签名串里的查询参数没有按编码后的键值排序，空格一会儿是 %20 一会儿是加号；请求头里的 User-Agent 被算进签名，但网关转发时会改写它；路径里的 ./ 和重复斜杠没有归一化，桶名后面多一个斜杠就换了另一个签名；Content-Type 带连续空格时修剪规则不一致；预签名链接有的过期判断差一小时，有的把有效期设成一年也照签；重放检测只在单进程内存里生效，滚动重启后同一个签名可以再用一次；并发校验时同一份签名会同时通过两次，账单上出现双份请求；快照恢复后统计和重放缓存全丢，审计对不上。模块路径 gsb/batch46-safety-a-07，文件名 sigv4_canonical_guard.py，类名 SigV4Guard，任务类型 Bugfix。
 
-需要补齐的接口：NewSigV4Guard(cfg Config) *SigV4Guard、NewSigV4GuardFromSnapshot(cfg Config, data []byte) (*SigV4Guard, error)、RegisterKey(id, secret, tenantID string) error、CanonicalQuery(rawQuery string) (string, error)、CanonicalURI(path string) (string, error)、CanonicalHeaders(headers map[string]string) (string, string, error)、CanonicalRequest(req Request) (string, error)、Sign(req Request, accessKeyID string, at time.Time) (string, error)、Verify(req Request, now time.Time) (string, error)、Presign(req Request, accessKeyID string, at time.Time, expires time.Duration) (string, error)、VerifyPresigned(method, rawURL string, now time.Time) error、ReplaySize() int、PruneReplay(now time.Time) int、Snapshot() ([]byte, error)。
+接口以骨架为准：canonical_query(query: Mapping[str, Any]) -> str；canonical_headers(headers: Mapping[str, str]) -> tuple[str, str]；canonical_uri(path: str, *, normalize: bool = True) -> str；build_canonical_request(request: Mapping[str, Any]) -> dict；string_to_sign(request: Mapping[str, Any], *, timestamp: str, scope: str, algorithm: str = "AWS4-HMAC-SHA256") -> dict；signing_key(secret_key: str, *, date: str, region: str, service: str) -> str；sign(request, credentials, *, now: int) -> dict；verify(request, credentials, *, now: int) -> dict；presign(request, credentials, *, expires: int, now: int) -> dict；verify_presigned(request, credentials, *, now: int) -> dict；purge_replays(cutoff: int) -> int；snapshot() -> dict；restore(state: Mapping[str, Any]) -> None；stats() -> dict。
 
-故障与边界：1）规范查询串只保留 A-Za-z0-9-._~，其余按大写十六进制百分号编码，原始加号编成 %2B、空格编成 %20，已有 %2f 先解码再输出 %2F；按编码后的名、再按值升序，裸参数补等号，空段跳过，坏转义 ErrMalformed。2）规范路径空串为 "/"，必须以 "/" 开头，点段和反斜杠 ErrMalformed，逐段编码并保留空段。3）规范头名小写、值去首尾空白并把连续空白（含制表符）压成一个空格、Host 值转小写、按名排序；Authorization 不参与签名，缺 Host 返回 ErrMissingHeader，头数超过 MaxHeaders 返回 ErrLimit，大小写不同的重名头 ErrMalformed。4）规范请求把方法转大写，只接受 https 且必须有 Host；正文取小写十六进制 SHA-256，空正文为 e3b0c442 开头的那串固定值，各行严格按方法、路径、查询、头块、空行、签名头列表、载荷哈希排列。5）Sign 对未注册的 key 返回 ErrUnknownKey，输出形如 AWS4-HMAC-SHA256 Credential=编号/日期/us-east-1/服务/aws4_request, SignedHeaders=列表, Signature=64 位小写十六进制，同输入必须同输出。6）Verify 缺 Authorization 或 x-amz-date 返回 ErrMissingHeader；凭据段不是五段、结尾不是 aws4_request、region 或 service 与配置不符、日期与 x-amz-date 不一致返回 ErrMalformed；时间差超过 MaxSkew 返回 ErrClockSkew；签名头列表变了或 HMAC 不符返回 ErrSignature，未知 key 返回 ErrUnknownKey，成功时返回 access key id。7）同一签名在 ReplayTTL 内第二次出现返回 ErrReplay，并发校验只能有一个成功，ReplaySize 反映缓存条目，PruneReplay 只清过窗口的条目。8）Presign 的 expires 非正或超过 PresignLimit 返回 ErrLimit，参数按名排序后追加 &X-Amz-Signature=，签名头固定 host，载荷固定 UNSIGNED-PAYLOAD。9）VerifyPresigned 缺参数或算法不符 ErrMalformed，X-Amz-Expires 超上限 ErrLimit，now 晚于起始加有效期 ErrExpired（正好等于截止时刻仍有效），方法或路径被改返回 ErrSignature。10）重放、签名、时钟三类错误不能互相冒充。11）Snapshot 只保存已用签名集合，恢复后重新注册密钥，重启后同一签名仍要拦住。
+具体规则与边界。规范查询串只保留 A-Za-z0-9-_.~ 不编码，空格编成 %20，其余按 UTF-8 字节大写十六进制百分号编码，键和值都编码后先按键再按值升序排列，同名多值逐条输出。规范请求头名转小写、值去首尾空白并把内部连续空白压成一个空格，排除 authorization、user-agent、x-amzn-trace-id、expect，按名字升序输出 name:value 加换行，签名头列表用分号连接。规范 URI 先合并重复斜杠、解析 . 和 ..，根路径输出 /，末尾斜杠保留，再逐段编码。build_canonical_request 返回 canonical_request、canonical_uri、canonical_query、signed_headers、payload_hash，整体按方法、URI、查询串、请求头块、空行、签名头、负载哈希排列，payload 为 None 或空串都取空串的 SHA-256，标记 unsigned_payload 时写 UNSIGNED-PAYLOAD。string_to_sign 返回 string_to_sign 和 canonical_hash 两个键，四行依次是算法、时间戳、scope、规范请求的哈希。signing_key 走 AWS4 前缀的四段 HMAC-SHA256 链，返回六十四位小写十六进制。sign 要求请求带 Host，注入 X-Amz-Date 并返回带 authorization 的完整请求，格式是 AWS4-HMAC-SHA256 Credential=密钥/日期/区域/服务/aws4_request, SignedHeaders=..., Signature=...。verify 的检查顺序是格式、时钟偏差、签名、重放；偏差绝对值超过 clock_skew 返回 SIG_CLOCK_SKEW，签名不符返回 SIG_SIGNATURE_MISMATCH，签名已用过返回 SIG_REPLAY，成功返回 SIG_OK。预签名失败时抛 SigV4Error，code 为 SIG_INVALID_EXPIRY；expires 必须大于零且不超过 604800，now 大于等于签发时刻加 expires 判为 SIG_EXPIRED。purge_replays 删除 seen_at 小于等于 cutoff 的记录并返回条数。stats 至少包含 signed、presigned、verified、rejected 四个计数。
 
-硬约束：签名判定与重放登记必须原子，缓存按 TTL 清理且规模有界；并发与重启后的结果要一致。网关前面还有一层 CDN，请求头会被改写，签名校验必须以到达网关时的原始内容为准，不能依赖上游排序；预签名链接主要给外部合作方使用，过期和越权都必须当场拒绝，不能靠后端再兜底。
-
-验收：go test ./... 的 15 条测试全部通过，不得修改测试、跳过或按固定输入写死；并发与重启场景自行验证；只做本地实现。
+硬约束：重放登记必须与签名校验在同一临界区完成，八路并发校验同一份签名只能有一个 SIG_OK、七个 SIG_REPLAY，verified 记一次、rejected 记七次；snapshot 深拷贝重放缓存和计数器，restore 完整替换，恢复后已用签名仍然判 SIG_REPLAY，快照不能被后续操作污染；重放缓存有 max_replays 上限，超出时按先进先出淘汰最旧记录，不能无限增长。验收：python3 -m pytest -q tests 的 15 条测试必须全部通过；不得修改测试、跳过或按固定输入写死；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -23,4 +21,4 @@ go test ./...
 - domain: 安全
 - sub: 身份认证
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
