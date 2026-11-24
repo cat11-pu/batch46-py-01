@@ -2,39 +2,20 @@
 
 ## 题面
 
-上周车联网平台做断网演练，运维发现三件事凑在一起：设备 A 在隧道里掉线，平台的掉线通知本该由遗嘱消息发出，结果晚了 4 分钟才到监控大屏；设备 B 用同一个 client id 重连，把旧连接顶掉，旧连接上 37 条未确认指令跟着消失；还有一批设备在会话过期后重连，离线队列里积压的报文被无上限地倒出来，直接把下行带宽打满；清理脚本只能按 client id 逐台核对，谁也说不清哪条遗嘱该发、哪条已经发过。任务在 gsb/batch46-safety-d-10 中完成，实现文件 mqtt_session_guard.go，类型 MqttSessionGuard，任务类型 Bugfix。
+智能家居的 MQTT 接入层最近连续出事：设备断网重连后订阅全部丢失，离线期间的告警没有补发；有用户正常关机却收到了自己的遗嘱消息，家属被误报吓到；设备只是网络抖动五秒，遗嘱延迟还没到就重新连上，结果延迟遗嘱照样发出去；同一客户端重连触发会话接管时，旧连接的遗嘱反而没发；QoS2 的下游重复收到同一条指令，packet id 被重复分配；离线队列没有上限，一次故障攒了几十万条把内存打满。修复范围在 gsb/batch46-safety-d-10 的 mqtt_session_guard.py，MqttSessionGuard 负责订阅、离线队列、in-flight 表、遗嘱和会话接管，任务类型 Bugfix，调用方不改。
 
-需要保留的公开能力：
+需要落地的接口（签名与骨架一致）：match(self, topic: str, topic_filter: str) -> bool；connect(self, client_id: str, *, clean_start: bool = False, will: dict | None = None, keepalive: int = 60, now: float | None = None) -> dict；subscribe(self, client_id: str, topic_filter: str, qos: int = 0) -> dict；unsubscribe(self, client_id: str, topic_filter: str) -> dict；deliver(self, client_id: str, topic: str, payload: bytes, *, qos: int = 0, expire_at: float | None = None) -> dict；acknowledge(self, client_id: str, packet_id: int, *, kind: str = "puback") -> dict；disconnect(self, client_id: str, *, graceful: bool = True, now: float | None = None) -> dict；keepalive_check(self, client_id: str, now: float | None = None) -> dict；pending(self, client_id: str) -> dict；will_for(self, client_id: str) -> dict | None；wills(self) -> list[dict]；purge(self, now: float | None = None) -> dict；session_state(self, client_id: str) -> dict；snapshot(self) -> dict；restore(self, state: dict) -> None；stats(self) -> dict。
 
-- NewMqttSessionGuard(cfg Config) *MqttSessionGuard
-- NewMqttSessionGuardFromSnapshot(cfg Config, data []byte) (*MqttSessionGuard, error)
-- (g *MqttSessionGuard) Connect(clientID string, cleanStart bool, will Will, now time.Time) (Takeover, error)
-- (g *MqttSessionGuard) Disconnect(clientID string, clean bool, now time.Time) error
-- (g *MqttSessionGuard) Lose(clientID string, now time.Time) error
-- (g *MqttSessionGuard) Queue(clientID string, msg Message, now time.Time) error
-- (g *MqttSessionGuard) Pending(clientID string) ([]Message, error)
-- (g *MqttSessionGuard) Next(clientID string, now time.Time) (Message, error)
-- (g *MqttSessionGuard) Ack(clientID string, packetID uint16) error
-- (g *MqttSessionGuard) Inflight(clientID string) (int, error)
-- (g *MqttSessionGuard) Subscribe(clientID, topic string) error
-- (g *MqttSessionGuard) Subscriptions(clientID string) ([]string, error)
-- (g *MqttSessionGuard) DueWills(now time.Time) []Will
-- (g *MqttSessionGuard) PurgeExpired(now time.Time) int
-- (g *MqttSessionGuard) SessionCount() int
-- (g *MqttSessionGuard) Info(clientID string) (SessionInfo, error)
-- (g *MqttSessionGuard) Stats() Stats
-- (g *MqttSessionGuard) Snapshot() ([]byte, error)
+返回字段固定：connect 返回 client_id、session_present、replayed、queued、inflight；deliver 返回 status、packet_id、qos，status 取 delivered、queued、dropped；disconnect 返回 client_id、graceful、will、session_removed；pending 返回 queued、queued_count、inflight、inflight_count；purge 返回 wills、expired；stats 至少包含 sessions、connections、delivered、queued、offline_dropped、expired、wills_published、wills_scheduled、wills_cancelled、takeovers、duplicates、replayed。
 
-故障与边界：1) 首次 Connect 返回 Replaced 为 false，已有在线连接被同一个 client id 顶掉时返回 true，顶替会清空旧连接的在途窗口、cleanStart 为 false 时保留未投递的离线队列，并把旧连接的遗嘱按立即到期入队、忽略遗嘱自带的 Delay；2) 正常 Disconnect 不论 clean 与否都不发遗嘱，clean 为 true 删除会话、队列和订阅，clean 为 false 保留队列与订阅并把 ExpiresAt 设为 now 加 SessionExpiry；3) cleanStart 为 true 的重连必须清空旧队列、在途窗口和订阅，但 Replaced 只在顶掉在线连接时为 true；4) Lose 表示非正常断开，连接标记为断开，遗嘱按自身 Delay 入队，Delay 为 0 时用配置的 WillDelay，DueWills 只返回到期时间小于等于 now 的遗嘱并从待发表移除；5) Queue 超过 MaxQueued 返回 ErrQueueFull 且保留已有消息不淘汰，会话已过期返回 ErrSessionAbsent 并顺手清掉过期会话；6) PacketID 在队列和在途窗口内都必须唯一，重复返回 ErrDuplicatePacketID，Ack 之后同一 ID 可以再次使用；7) Next 在队列为空时返回 ErrQueueEmpty，在途达到 MaxInflight 返回 ErrInflightLimit，成功时从队首取出并计入在途；8) Ack 未知 packet id 返回 ErrUnknownPacketID，重复 Ack 不能把在途数减成负数；9) Pending 按 FIFO 返回队列副本，Next 之后 Pending 不再包含已取出的消息；10) Subscribe 幂等，同一主题不重复记录，Subscriptions 按字典序返回，未知会话返回 ErrSessionAbsent；11) PurgeExpired 只清理已断开且 now 已达到 ExpiresAt 的会话并返回条数，在线会话一律保留；12) Stats 的 Sessions、Queued、Inflight、WillsPending、Takeovers 必须和实际状态一致，失败的 Connect、Queue、Ack 不能虚增。
+具体故障与边界：一、主题过滤器里 + 只匹配一层、# 只能出现在末尾并匹配剩余所有层，过滤器为空、# 不在末尾、+ 混在层级中间都按 MQTT_INVALID_FILTER 拒绝，发布主题带通配符按 MQTT_INVALID_TOPIC，客户端为空按 MQTT_INVALID_CLIENT，QoS 不在 0 到 2 按 MQTT_INVALID_QOS；二、clean_start 连接要丢掉旧的订阅、队列和 in-flight，正常断开后会话整体删除，下次连接 session_present 为假；三、持久会话断开期间的消息按先来后到排队，重连时按 FIFO 回放并把已回放消息计入 replayed；四、离线队列超过 max_offline 时丢最老的一条并累加 offline_dropped；五、投递 QoS 要取发布 QoS 和匹配订阅的最大 QoS 的较小值，一个订阅都不匹配时返回 dropped 和 MQTT_NO_MATCH；六、PUBACK 清掉 in-flight，包号不存在按 MQTT_PACKET_UNKNOWN；七、QoS2 的重复 PUBREC 只能返回 duplicate 并累加 duplicates，不能重复投递，PUBREL 之后才移出 in-flight；八、包号从 1 开始分配，总是取当前 in-flight 里没有的最小号，释放后可以复用；九、正常断开必须抑制遗嘱，非正常断开且延迟为 0 立即发布，延迟大于 0 先挂起并累加 wills_scheduled；十、同一客户端在延迟遗嘱到期前重连要取消遗嘱并累加 wills_cancelled，purge 到期后发布遗嘱并累加 wills_published，同时清掉 expire_at 已过的排队消息并累加 expired；十一、keepalive 超过 1.5 倍周期没心跳按非正常断开处理，返回 action 为 will_published，会话接管时旧连接的遗嘱按同一规则处理并累加 takeovers；十二、快照要能 json.dumps，恢复后订阅、队列、in-flight 和计数都要对上，版本不符抛 MQTT_SNAPSHOT_VERSION 且原状态一个字段都不许动。
 
-硬约束：同一 client id 被大量并发 Connect 时只能有一个返回 Replaced 为 false，其余全部是顶替且各自把上一条连接的遗嘱排入待发表，最终会话数只能是 1；队列、在途窗口、遗嘱待发表各自有上限或明确的清理时机，任何路径都不能绕过 MaxQueued 与 MaxInflight；Snapshot 要保留会话的连接状态、绝对过期时刻、队列顺序、在途 packet id、订阅和待发遗嘱，重启恢复后 Pending、Subscriptions、DueWills 与重启前一致。
-
-验收：go test ./... 的 15 条用例全部通过；不得修改测试、跳过用例或按固定输入写死；并发与重启恢复需要自行验证；只做本地实现，不涉及上游提交。
+硬约束：二十个线程同时对同一个离线会话投递不同消息，队列里必须一条不少、一条不重，计数不能多记也不能漏记；回放必须保持入队顺序；离线队列和 in-flight 表都有硬上限，任何路径都不能突破；快照恢复要么整体生效要么整体回退。验收：python3 -m pytest -q tests 的 15 条测试全过，不得改测试、跳过或按固定输入写死，并发和重启场景自己造数据验证，只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -42,4 +23,4 @@ go test ./...
 - domain: 安全
 - sub: 网络与通信安全
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
