@@ -2,46 +2,20 @@
 
 ## 题面
 
-HR 系统每小时往内部用户目录推一次增量，最近一个月出了四起数据事故：已经离职删除的账号在下一轮同步里被同一个 externalId 重新建了出来，权限跟着回来了；同一条变更事件被上游重试三次，用户版本号一路涨到 7，下游缓存全部失效；两个不同的人用了同一个邮箱，目录里出现两个账号，登录时随机命中其中一个；批量接口返回 500 时一半用户已经写进去、另一半没写，第二天对账差了三百多人。另外分页游标用的是偏移量，同步过程中有人新增就会漏页；网关重启后删除标记清零，被删的人又被加了回来。这次要把增量同步做成可重放、可恢复的，模块路径 gsb/batch46-safety-a-04，实现文件 scim_provisioning_guard.go，类型 ScimGuard，任务类型 Bugfix。
+HR 系统通过 SCIM 向四个租户同步员工账号，上季度人员调整时同步链路出了一连串事故。增量事件乱序到达，版本一的旧记录把已经改好的职位覆盖回去；同一事件被上游重试两次，用户资料被写了两遍；版本号相同但内容不同的事件也照写；员工离职后账号删除，三个月后重新入职用同一个 user id 时新旧数据打架；删除的用户仍出现在全量列表里，下游又把权限发了一遍；一条 PATCH 里两个操作，前一个改成功、后一个路径不支持，结果脏数据留在库里；没带版本条件的 PATCH 覆盖了页面正在编辑的字段；批量补发里混进别家租户的记录，前半批已经写进去才发现；单租户用户数没有上限，测试租户一次灌了四十万条；两个租户用了相同的 user id，查询串到另一边；某客户 offboarding 之后残留用户仍能被搜到；进程重启后版本号和已处理事件列表全丢，重复事件又开始生效。
 
-需要保留的公开能力：
+范围是 gsb/batch46-safety-a-04 下的 scim_provisioning_guard.py，类 ScimGuard，任务类型 Bugfix，负责租户登记、用户增量写入、PATCH、停用、批量补发与快照。公开接口（Python 类型注解）：`ScimGuard(*, max_users_per_tenant: int = 1000, max_batch: int = 200)`；`register_tenant(tenant: str, *, source: str, allowed_domains=()) -> dict`；`upsert(tenant: str, resource: dict) -> dict`；`patch(tenant: str, user_id: str, operations, *, expected_version=None) -> dict`；`deactivate(tenant: str, user_id: str, *, expected_version=None) -> dict`；`get(tenant: str, user_id: str) -> dict`；`list_users(tenant: str, *, include_deleted: bool = False) -> list`；`apply_batch(tenant: str, events) -> dict`；`is_applied(tenant: str, event_id: str) -> bool`；`purge_tenant(tenant: str) -> int`；`snapshot() -> dict`；`restore(state: dict) -> None`。所有失败抛 ScimError(code, detail)。
 
-- NewScimGuard(p ScimPolicy) *ScimGuard
-- NewScimGuardFromSnapshot(p ScimPolicy, data []byte) (*ScimGuard, error)
-- (g *ScimGuard) Apply(user User, expectedVersion int) (ApplyResult, error)
-- (g *ScimGuard) Patch(tenantID, userID string, ops []PatchOperation, expectedVersion int) (ApplyResult, error)
-- (g *ScimGuard) Delete(tenantID, externalID string, expectedVersion int, now time.Time) error
-- (g *ScimGuard) Get(tenantID, userID string) (User, error)
-- (g *ScimGuard) ByExternalID(tenantID, externalID string) (User, error)
-- (g *ScimGuard) Batch(tenantID string, users []User) ([]ApplyResult, error)
-- (g *ScimGuard) Page(tenantID, cursor string, limit int) ([]User, string, error)
-- (g *ScimGuard) Tombstoned(tenantID, externalID string, now time.Time) (bool, error)
-- (g *ScimGuard) Snapshot(now time.Time) ([]byte, error)
-- (g *ScimGuard) Stats() ScimStats
+故障与边界：一、resource 必须带非空字符串 id、非空 userName 和大于等于一的整数 version，active 必须是布尔值，否则抛 SCIM_INVALID_RESOURCE，version 为 True 也按非法处理；二、未登记租户一律抛 SCIM_UNKNOWN_TENANT，重复登记 source 或 allowed_domains 不同抛 SCIM_CONFLICT，完全相同幂等；三、version 小于或等于已存版本返回 stale 与 SCIM_VERSION_STALE，不得改动数据，返回已存版本；四、event_id 命中已处理集合时优先返回 duplicate 与 SCIM_DUPLICATE_EVENT，即使版本更高也不再写入；五、PATCH 支持 add、replace、remove，path 仅限 userName、displayName、active、externalId，未知 op 抛 SCIM_UNSUPPORTED_OPERATION，未知 path 抛 SCIM_UNSUPPORTED_PATH，remove userName 或 active 抛 SCIM_REQUIRED_ATTRIBUTE，空操作列表抛 SCIM_INVALID_OPERATION；六、PATCH 必须整批原子，任一操作非法则整个调用不产生任何修改，成功时版本只加一；七、expected_version 与当前版本不一致抛 SCIM_VERSION_CONFLICT；八、deactivate 把 active 置 false 并留下 deleted 墓碑，版本加一，重复停用抛 SCIM_ALREADY_DELETED，墓碑不出现在默认列表、带 include_deleted 时可见，之后更高版本的 upsert 可以复活该用户；九、apply_batch 先整体校验租户归属与字段合法性，任一记录 tenant 与参数不一致抛 SCIM_TENANT_MISMATCH，任一字段非法抛 SCIM_INVALID_RESOURCE，两种情况都不能留下半批数据；十、apply_batch 按 version 升序应用，返回 applied、stale、duplicate、noop 计数与逐条 results，长度超过 max_batch 抛 SCIM_BATCH_TOO_LARGE；十一、get 返回 id、userName、displayName、active、version、deleted、externalId 七个字段，未知用户抛 SCIM_NOT_FOUND，已删除用户 PATCH 抛 SCIM_DELETED；十二、租户容量 max_users_per_tenant 把墓碑也算在内，purge_tenant 删除整个租户并返回用户数，之后访问该租户抛 SCIM_UNKNOWN_TENANT。
 
-故障与边界：
+硬约束：PATCH 与 deactivate 在校验版本后必须在同一把锁内完成版本递增，八线程带同一个 expected_version 并发修改只能有一个成功；apply_batch 的预校验与排序应用必须保证原子校验，不能先写后报错；租户之间的用户表和事件去重表完全隔离，禁止跨租户读写；snapshot/restore 覆盖租户配置、用户记录、墓碑和已处理事件，恢复后重复事件仍被识别，结构非法抛 SCIM_SNAPSHOT_INVALID 且原状态不变。
 
-1. Apply 以租户加 externalId 为键，首次创建时 UserID 取 tenantID 加斜杠加 externalId，Version 从 1 开始，Created 为 true；
-2. 内容完全一致的重放（用户名、启用状态、邮箱集合、组集合全相同）直接返回当前版本，Created 为 false，版本不涨，即使 expectedVersion 落后也不报冲突；
-3. 内容有变化且 expectedVersion 等于当前版本时版本加一、Updated 加一；expectedVersion 落后返回 ErrVersionConflict 且不落盘；expectedVersion 为 -1 跳过版本检查；
-4. 同一租户内两个用户的邮箱集合不允许有交集，冲突返回 ErrDuplicateEmail，且不能留下半个用户；跨租户同邮箱允许；
-5. 邮箱和组在写入前要去重并按字典序排序，Get 返回的顺序必须是稳定排序后的结果；
-6. Delete 按 externalId 删除并记录删除时刻，版本不符返回 ErrVersionConflict；删除后 Get 返回 ErrNotFound，Tombstoned 为 true，Users 减一、Tombstones 加一；
-7. 墓碑有效期内用同一 externalId 重新 Apply 返回 ErrDeleted；墓碑过期后由 PruneTombstones 清掉并返回条数，清掉之后 Tombstoned 为 false；
-8. Patch 支持 groups 的 add/remove 和 userName 的 replace，未知 op 或 path 返回 ErrInvalidPatch 且版本不动；一次 Patch 最多涨一个版本；
-9. Batch 整批使用入参 tenantID，先整批校验再落盘，任何一条失败整批不写并返回对应错误；成功时结果顺序与入参一致；
-10. 批量条数超过 MaxBatch 返回 ErrBatchTooLarge；用户总数超过 MaxUsers 返回 ErrCapacity；
-11. Page 按 UserID 升序返回，cursor 取上一页最后一条的 UserID，最后一页 cursor 为空；五个用户、每页两条时分三页取完；
-12. Snapshot 要包含存活用户和墓碑，重启恢复后 ByExternalID、Tombstoned 与统计数字都对得上；Stats 的 Users、Tombstones、Created、Updated、Deleted 要与实际状态一致。
-
-硬约束：同一 externalId 被并发 Apply 时只能出现一次 Created，其余请求看到同一个版本 1，不能建出两个用户；重启恢复后的墓碑继续拒绝重建，不能因为内存清零把已删账号放回来；批量写入必须整批原子，失败不留半条记录；所有时间判断使用入参 now，不读系统时钟，否则回放和补数对不上。
-
-验收：go test ./... 的 15 条用例全部通过；不得修改测试、跳过用例或按固定输入写死；并发和重启恢复要自行验证；只做本地实现，不涉及上游仓库。
+验收：`python3 -m pytest -q tests` 的 15 条测试全部通过；不得修改测试、跳过或按固定输入写死；并发与重启恢复场景自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
