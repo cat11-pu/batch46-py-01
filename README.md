@@ -2,34 +2,20 @@
 
 ## 题面
 
-周二上午，安全团队用旁路流量给自建 DoT 网关做指纹测试，发现 45 字节的 A 查询在链路上原样出现，长度分布和明文 DNS 几乎一样，观察者不用解密就能按报文长度猜出用户访问的域名类别。同一份抓包还暴露出连接管理的问题：网关只开了两条长连接，每条的并发查询被堆到几百，其中一条抖动断开时上面所有在途查询一起失败；空闲连接又一直挂着不释放。接入层的连接复用和填充策略是两拨人先后加的，账目对不上时很难判断是填充算法算错了还是池子漏了租约，值班只能靠重启网关把连接清空。任务在 gsb/batch46-safety-d-07 中完成，实现文件 dot_padding_guard.go，类型 DotPaddingGuard，任务类型 Bugfix，要求填充计算和连接池账目在同一份状态里对齐。
+上周三凌晨，海外分支的 DoT 探针突然被上游限速，抓包发现我们发出的查询长度参差不齐，同一条链路上查询和响应尺寸差距明显，被运营商按长度指纹识别；同时长连接复用写错了租户维度，一个客户的连接被另一个客户复用，审计直接标红。值班同学最初以为是 TLS 版本问题，后来发现填充块大小、长度前缀和连接池各自为政，代码里没有任何一处把三者对齐。修复范围在 gsb/batch46-safety-d-07 的 dot_padding_guard.py，DotPaddingGuard 负责帧封装、填充校验和连接复用，任务类型 Bugfix，公共接口不许改。
 
-需要保留的公开能力：
+需要落地的接口（签名与骨架一致）：encode(self, message: dict, *, block: int | None = None) -> bytes；decode(self, frame: bytes) -> dict；open(self, tenant: str, peer: str) -> str；submit(self, conn_id: str, message: dict, *, timeout: float | None = None) -> dict；complete(self, conn_id: str, frame: bytes) -> dict；close(self, conn_id: str) -> dict；pending(self, conn_id: str) -> list[int]；sweep(self) -> dict；snapshot(self) -> dict；restore(self, state: dict) -> None；stats(self) -> dict。
 
-- NewDotPaddingGuard(cfg Config) *DotPaddingGuard
-- NewDotPaddingGuardFromSnapshot(cfg Config, data []byte) (*DotPaddingGuard, error)
-- (g *DotPaddingGuard) PadLength(wireSize int) (int, error)
-- (g *DotPaddingGuard) PaddingBytes(wireSize int) (int, error)
-- (g *DotPaddingGuard) Acquire(now time.Time) (string, error)
-- (g *DotPaddingGuard) Release(connID string, now time.Time) error
-- (g *DotPaddingGuard) MarkSent(connID string) error
-- (g *DotPaddingGuard) Outstanding(connID string) (int, error)
-- (g *DotPaddingGuard) ConnCount() int
-- (g *DotPaddingGuard) CloseConn(connID string) error
-- (g *DotPaddingGuard) CloseIdle(now time.Time) int
-- (g *DotPaddingGuard) Stats() Stats
-- (g *DotPaddingGuard) Snapshot() ([]byte, error)
+帧格式固定为：两字节大端长度前缀、两字节消息号、负载，末尾跟 12 号填充选项（两字节选项码、两字节长度、若干零字节），整帧长度必须是 block 的整数倍，默认 468；组帧选最小填充量。返回字段固定：submit 返回 conn_id、message_id、frame、padded_to、deadline；complete 返回 status、message_id、payload、padding、wait；sweep 返回 closed、expired；stats 至少包含 connections、pending、sent、received、duplicates、expired、reused、dropped、closed、closed_idle、evicted。
 
-故障与边界：1) PadLength 取 max(wireSize, MinSize) 后向上取整到 BlockSize 的倍数，128 字节在 block 128 时必须保持 128，不能多加一整块；2) wireSize 为负或 BlockSize 小于等于 0 返回 ErrInvalidConfig，不能除零；3) 取整结果超过 MaxSize 返回 ErrTooLarge，500 字节在 block 128、MaxSize 512 下得到 512，而 MinSize 与 MaxSize 都是 500 时取整到 512 必须报错；4) PaddingBytes 必须恰好等于 PadLength 减去 wireSize，整数倍时返回 0；5) Acquire 优先选 Outstanding 最少的连接，负载相同时选最早创建的，只有全部连接都达到 MaxOutstanding 且 ConnCount 未到 MaxConns 才新建连接；6) 全部连接满载时返回 ErrPoolFull，返回的连接 ID 必须是空字符串，失败的申请不能占用任何计数；7) Release 对未知连接、或已经释放到 0 的连接返回 ErrUnknownConn，计数不能变成负数，重复释放不能让 Released 虚增；8) MarkSent 累计该连接发出的查询数，超过 MaxQueriesPerConn 返回 ErrQueryBudget，预算用完的连接在最后一个租约释放后立即下线，下一次 Acquire 必须换到新连接；9) CloseIdle 只关闭 Outstanding 为 0 且空闲时间达到 IdleTimeout 的连接并返回关闭条数，仍在服务查询的连接一律保留，紧接着再清理一次应返回 0；10) CloseConn 关闭任意已知连接并清理账目，未知 ID 返回 ErrUnknownConn；11) Stats 的 Conns、Outstanding、Acquired、Released 要和当前账面对得上，失败的申请与重复释放不能虚增；12) Snapshot 恢复后连接 ID、Outstanding、Sent、LastUsed 保持不变，能继续用原 ID 释放租约，空字节或损坏内容返回 ErrCorruptSnapshot。
+具体故障与边界：一、block 小于 16 或不是 4 的倍数按 DOT_INVALID_BLOCK 拒绝；二、消息号超出 0 到 65535、负载不是 bytes，分别按 DOT_INVALID_MESSAGE_ID、DOT_INVALID_PAYLOAD 拒绝；三、解帧声明的长度与真实长度不一致按 DOT_LENGTH_MISMATCH；四、整帧不是 block 整数倍按 DOT_PADDING_MISALIGNED；五、填充选项后面还有字节按 DOT_PADDING_NOT_LAST；六、填充字节不全是零按 DOT_PADDING_NOT_ZERO；七、同一租户同一对端要复用连接并累加 reused，跨租户必须新建；八、连接数达到 max_connections 时先淘汰最老的空闲连接并累加 evicted，没有空闲连接才抛 DOT_CONN_LIMIT；九、单连接待回消息达到 max_pending 抛 DOT_PENDING_LIMIT，同一消息号重复提交抛 DOT_DUPLICATE_MESSAGE；十、响应按消息号匹配，可以乱序到达，重复响应返回 status 为 duplicate 并累加 duplicates，出现在别的连接上按 DOT_CROSS_CONNECTION 拒绝；十一、sweep 要把超过 deadline 的待回消息清掉并统计 expired，把超过 idle_timeout 的空闲连接关掉列进 closed；十二、快照必须能直接 json.dumps，恢复后待回消息、绝对 deadline 和计数都要对上，版本不符抛 DOT_SNAPSHOT_VERSION 且原状态不动。
 
-硬约束：并发抢槽时任何连接的 Outstanding 都不能超过 MaxOutstanding，40 个并发租约全部释放后 Outstanding 必须归零，ConnCount 不能越过 MaxConns；连接预算与空闲清理必须原子地作用在同一份池状态上，不能出现已经下线却还能释放的残留条目；快照要从绝对时间恢复，重启后空闲时长继续累计。
-
-验收：go test ./... 的 15 条用例全部通过；不得修改测试、跳过用例或按固定输入写死；并发与重启恢复需要自行验证；只做本地实现，不涉及上游提交。
+硬约束：submit 与 complete 会被多线程并发调用，八个线程同时提交同一消息号只能成功一次，其余必须收到 DOT_DUPLICATE_MESSAGE，计数不能多记；恢复快照要么整体生效要么整体回退；连接数、单连接待回数都有上限，任何路径都不能越界；关闭连接时要先把丢弃的待回消息数报出来，不允许静默丢包，统计口径在重启后必须连续，不能出现负数或回退。验收：python3 -m pytest -q tests 的 15 条测试全过，不得改测试、跳过或按固定输入写死，并发和重启场景自己写脚本验证，只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
