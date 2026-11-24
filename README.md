@@ -2,32 +2,20 @@
 
 ## 题面
 
-周五凌晨，外网递归解析器被上游递来的记录带偏：值班同学在缓存里看到 bank.example.net 指向 203.0.113.9，而这条记录是 example.com 的权威应答塞进来的。最初怀疑上游被黑，把回包逐字段拆开才发现，入库时只看了记录名能不能解析，没看它是否属于回包的 zone，也不区分记录类型和 class，于是任何上游都能顺带把别家的 A 记录写进来，驻留一小时后才过期。更麻烦的是，一条越界记录混在正常应答里时，前面几条合法记录已经进了缓存，回滚只能靠人工逐条删，第二天同一批用户又解析到了错误地址。任务在 gsb/batch46-safety-d-06 中完成，实现文件 dns_cache_poison_guard.go，类型 DnsCacheGuard，任务类型 Bugfix。
+凌晨的告警是这样来的：三地机房的递归解析器把一批不属于委派区的 A 记录写进了共享缓存，内网门户随后被指到一台陌生地址，值班同学手动清缓存才恢复。复盘发现解析器对上游响应几乎不做校验，谁先回包谁就能改缓存，大小写、授权区、粘附记录全都没有管。这次修复落在 gsb/batch46-safety-d-06 的 dns_cache_poison_guard.py，DnsCacheGuard 要成为缓存写入口的唯一闸门，任务类型 Bugfix，公共调用方不许改。
 
-需要保留的公开能力：
+需要落地的接口（签名与骨架一致）：define_zone(self, zone: str, *, parent: str = "") -> dict；register_query(self, qname: str, qtype: str, *, zone: str) -> dict；validate_response(self, response: dict) -> dict；lookup(self, qname: str, qtype: str) -> dict；expire(self, now=None) -> int；flush_zone(self, zone: str) -> int；trim(self) -> int；snapshot(self) -> dict；restore(self, state: dict) -> None；stats(self) -> dict；pending_count(self) -> int。
 
-- NewDnsCacheGuard(cfg Config) *DnsCacheGuard
-- NewDnsCacheGuardFromSnapshot(cfg Config, data []byte) (*DnsCacheGuard, error)
-- (c *DnsCacheGuard) InBailiwick(zone, name string) bool
-- (c *DnsCacheGuard) Insert(zone string, rr RR, now time.Time) error
-- (c *DnsCacheGuard) InsertResponse(resp Response, now time.Time) (int, error)
-- (c *DnsCacheGuard) Lookup(name string, qtype uint16, now time.Time) ([]RR, error)
-- (c *DnsCacheGuard) Delete(name string) int
-- (c *DnsCacheGuard) PurgeExpired(now time.Time) int
-- (c *DnsCacheGuard) Len() int
-- (c *DnsCacheGuard) Stats() Stats
-- (c *DnsCacheGuard) Snapshot() ([]byte, error)
+返回结构和统计键名固定下来：validate_response 返回 status、code、cached、dropped_glue、answers、additional；lookup 返回 hit、records、ttl；票据字段为 query_id、qname、qtype、zone、case_token；stats 至少包含 pending、cache_entries、accepted、rejected、dropped_glue、pending_evicted、evicted、replays。所有拒绝路径都要先记录拒绝计数再返回，不能因为提前 return 漏计；被淘汰的票据计入 pending_evicted，被容量淘汰的缓存条目计入 evicted，重复回包计入 replays，重启恢复后统计数值要与快照对上，不能从零开始。
 
-故障与边界：1) 记录 owner 不在回包 zone 内（包括 notexample.com 这种同后缀但非子域的写法，以及 zone 写成 corp.internal、owner 写成 example.com 的情况）必须返回 ErrBailiwick，且不能写入缓存；2) 一份应答里只要有一条越界记录，整份 Answers 都不许落库，返回的插入计数为 0，之前已经判过的合法记录也要一并回滚；3) TTL 为 0 的记录返回 ErrTTLZero，不能按最小 TTL 兜底；4) class 不是 IN 的记录返回 ErrBadClass；5) 正向 TTL 要夹在 MinTTL 与 MaxTTL 之间，上游给 2 秒和 86400 秒都要按配置收敛；6) 过期记录不能再被 Lookup 命中，此时返回 ErrNotFound 并计入 Misses，命中一次要计入 Hits；7) 名字比较忽略大小写，单个结尾点可有可无，同一 owner 的不同类型分别缓存，A 记录不能回答 AAAA 或 TXT 查询；8) MaxEntries 满了以后新 key 返回 ErrCacheFull，不允许为了腾位置淘汰仍在有效期内的记录，但过期 key 必须在写入前先被回收；9) NXDOMAIN 应答按 NegativeTTL 做负缓存，窗口内 Lookup 返回 ErrNXDomain，窗口后回到 ErrNotFound，负缓存不占用正向记录的 key；10) 被拒绝的写入要计入 Stats.Rejected，且不能留下半条记录；11) Delete 要删掉该名字下所有类型和负缓存条目并返回删除的 key 数，名字不存在时返回 0；12) 快照为空字节或内容损坏时，恢复函数返回 ErrCorruptSnapshot，不能返回一个半初始化的缓存。
+具体故障与边界：一、出站查询只能在 define_zone 注册过的区内发起，未注册的区或区外域名按 DNS_UNKNOWN_ZONE、DNS_OUT_OF_BAILIWICK 拒绝；二、每张票据带一个大小写混排的 qname 令牌，回包 qname 必须逐字符匹配，否则 DNS_CASE_MISMATCH，令牌只能用一次，二次回包按 DNS_REPLAY 拒绝；三、答案和权威区记录的名字必须在查询所属区内，越界分别按 DNS_OUT_OF_BAILIWICK、DNS_AUTHORITY_ESCAPE 整包拒收，一条都不许入缓存；四、CNAME 目标落在区外按 DNS_CNAME_ESCAPE 拒收；五、附加区里区外的粘附记录只丢该条，计数进 dropped_glue，不能因此丢整包；六、同一 RRset 重复记录去重，TTL 取最小值，名字统一小写；七、TTL 超过 max_ttl 要截断，TTL 小于等于零的答案可以接受但不入缓存；八、票据数超过 max_pending 时淘汰最老的一张，被淘汰票据的回包按 DNS_UNKNOWN_QUERY 拒绝；九、缓存条目超过 max_entries 时优先淘汰最早到期的条目；十、lookup 命中返回剩余秒数，过期条目必须顺手删除；十一、flush_zone 只清该区及其子域，不能误伤平级区；十二、快照要能序列化，恢复后按绝对到期时间续算剩余 TTL，版本不符抛 DNS_SNAPSHOT_VERSION 且原缓存不受影响。
 
-硬约束：同一份应答的写入要么全部生效要么全部不生效，并发写同一批名字时缓存里只能留下一致结果，Len 与 Stats 的计数不能和实际 key 数对不上；Snapshot 必须带上每条记录的绝对过期时刻，重启恢复后剩余 TTL 从原截止时间继续算，不能重新起算，也不能把已经过期的记录带回来；PurgeExpired 返回清理条数并同步收缩 Len，正常 Lookup 不应因为清理而少返回仍然有效的记录。
-
-验收：go test ./... 的 15 条用例全部通过；不得修改测试、跳过用例或按固定输入写死；并发与重启恢复需要自行验证；只做本地实现，不涉及上游提交。
+硬约束：validate_response 和 lookup 会被八个刷新线程同时调用，同一张票据并发回包只能有一个 accepted，其余必须是 DNS_REPLAY，计数不能重复；快照恢复要么整体成功要么整体不动，不允许半份状态；缓存和待查票据都有上限，任何路径都不能突破，也不存在绕过缓存的旁路。验收：python3 -m pytest -q tests 的 15 条测试全过，不得改测试、跳过或按固定输入写死，并发与重启场景自己造数据验证，只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -35,4 +23,4 @@ go test ./...
 - domain: 安全
 - sub: 网络与通信安全
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
