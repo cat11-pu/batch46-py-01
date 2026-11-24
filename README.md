@@ -2,20 +2,20 @@
 
 ## 题面
 
-凌晨割接后核心交换机出了一串怪事：过期会话还能下发配置，同一个会话标识被两台设备复用，甲租户的规则放行了乙租户的命令，重复上报的计费把字节数算了两遍。相关逻辑在模块 gsb/batch46-safety-a-06 的 tacacs_authz_guard.go，类型 TacacsGuard，任务类型 Bugfix，需要把会话、授权、计费三条链路一起修好。值班同学查了两晚，确认不是设备侧的问题，而是我们自己的 AAA 服务把状态放错了地方。这批设备分布在三个机房，白天有存量会话，夜里还有批量作业，所以修复不能靠重启清状态，也不能让某个租户的规则忽然失效。
+昨夜值班组切换了新的 TACACS+ 网关，设备授权和计费都落到 gsb/batch46-safety-a-06 的 tacacs_authz_guard.py，类型是 TacacsGuard，任务类型 Bugfix。上线后故障单堆了一摞：低权限账号执行 reload 被拒，升到十五级后仍然被拒，看起来上一次判断被缓存住了；两个命令组的规则拼在一起时，同一个账号在两台设备上得到相反结果，顺序完全取决于注册时怎么填 groups；一条 deny 规则排在 show * 前面，却被后面的通配规则放行了；没注册的临时账号直接拿到拒绝回执，而不是明确的未知用户错误；计费面重复提交同一个 session id，两次都开成功，报表里一台设备挂了两条会话；会话关闭以后再补发流量计数，接口不报错，还把已关闭的会话改了；计数器回退也能写进去，账单算成负数；新会话把表撑满后没有回收，正常登录全部失败；补丁回滚重启后会话快照丢了，已关闭的会话又变回打开；审计日志没有上限，一天涨到两百万行把磁盘写满；多线程授权时审计条数和实际请求数对不上。模块路径 gsb/batch46-safety-a-06，文件名 tacacs_authz_guard.py，类名 TacacsGuard，请按下面的契约补齐实现。
 
-接口按现有骨架实现：NewTacacsGuard(cfg Config) *TacacsGuard、NewTacacsGuardFromSnapshot(cfg Config, data []byte) (*TacacsGuard, error)、Authenticate(sessionID, user, deviceID, tenantID string, now time.Time) error、SessionActive(sessionID string, now time.Time) (bool, error)、ExpireSessions(now time.Time) int、AddRule(r Rule) error、RuleCount() int、Authorize(req AuthorizeRequest, now time.Time) (Decision, error)、Accounting(rec AcctRecord, now time.Time) error、AcctUsage(taskID string) (int64, error)、Prune(now time.Time) int、Snapshot() ([]byte, error)。
+关键接口保持现有骨架：define_command_set(name: str, *, rules: Sequence[Mapping[str, Any]], default: str = "deny") -> dict；register_user(username: str, *, privilege: int = 1, groups: Sequence[str] = ()) -> dict；set_privilege(username: str, privilege: int) -> dict；authorize(username: str, command: str, *, device: str | None = None) -> dict；account_start(username: str, session_id: str, *, device: str, started_at: int | None = None) -> dict；account_update(session_id: str, *, bytes_in: int | None = None, bytes_out: int | None = None) -> dict；account_stop(session_id: str, *, stopped_at: int | None = None, reason: str = "normal") -> dict；sessions(username: str | None = None) -> list[dict]；snapshot() -> dict；restore(state: Mapping[str, Any]) -> None；purge_closed() -> int；audit(limit: int | None = None) -> list[dict]。
 
-具体要改的点：1）会话在 now 到达 expires 的瞬间失效，之前仍可授权；2）未过期的重复会话标识返回 ErrArgInvalid，过期后允许同名重建；3）单设备活跃会话数达到 MaxSessions 后返回 ErrLimit，已过期的不计入；4）授权先查会话，未知、过期、用户或租户不符一律 ErrUnauthenticated，规则不跨租户共享；5）规则按 Order 升序、同序按 Name 排序取第一条命中，deny 返回 ErrNotAuthorized、Decision.Rule 为规则名、AVs 为空，无命中时 Rule 为 default-deny；6）Rule.Args 为 nil 表示任意参数，否则长度一致且逐项相等，单项 "*" 通配，permit 按声明顺序返回 AV；7）参数个数超过 MaxArgs 返回 ErrLimit，正好等于上限放行；8）计费 Flags 仅接受 start/watchdog/stop，其余 ErrArgInvalid；未 start 的 watchdog/stop、重复 start、重复 stop 均 ErrAccounting，被拒记录不得改动累计字节；9）watchdog 与 stop 的 Bytes 累加，AcctUsage 返回累计值，未知任务 ErrAccounting，计费前会话必须存活且属于同一用户，否则 ErrUnauthenticated；10）ExpireSessions 只清会话并返回删除数，Prune 同时清过期会话与超过 AcctRetention 的已关闭任务并返回两者之和；11）Snapshot 覆盖会话、规则、计费，重启恢复后会话仍活跃、规则仍生效、累计字节不变；12）授权与计费并发执行时结果与串行一致。
+具体故障与边界如下。命令规则按列表顺序匹配，命中即停，deny 排在前面就不能被后面的 show * 翻案，未命中时取命令集的 default，放行返回 TAC_PERMIT，规则拒绝返回 TAC_DENY_RULE，默认拒绝返回 TAC_DENY_DEFAULT，规则序号是规则列表里的全局下标。规则的 min_privilege 高于用户当前等级时跳过该条继续看后面的规则，而不是直接拒绝；set_privilege 返回的用户记录里 privilege 必须是新值，下一次 authorize 立即生效。未注册用户调用 authorize 抛 TacacsError，code 为 TAC_DENY_UNKNOWN_USER，不能伪装成普通 deny。多个组的规则按 groups 顺序拼接，后一个组不能因为更严格就提前生效。同一 session id 重复 account_start 抛 TAC_DUP_SESSION，第一次建立的设备信息不能被覆盖。account_stop 用 stopped_at 减 started_at 得到 elapsed，未知或已清理的会话抛 TAC_NO_SESSION。account_update 的 bytes_in 和 bytes_out 只增不减，回退抛 TAC_COUNTER_REGRESS 并保留旧值，已关闭会话再更新抛 TAC_SESSION_CLOSED。活跃会话数达到 max_sessions 时新会话抛 TAC_SESSION_LIMIT，关闭会话释放名额，已关闭会话不占名额。sessions 按 session_id 升序返回，可按用户名过滤，行里至少要有 session_id、user、device、status、started_at、bytes_in、bytes_out。重新 define_command_set 后旧授权结论立即失效。审计只保留最近 max_audit 条，按发生时间从旧到新返回，audit(limit) 取最近 limit 条，每条至少带 command 和 code。
 
-硬约束：状态判定与写入必须在一把锁内完成，重复会话和重复 start 的判定要原子；被拒绝的请求不能留下任何副作用；会话数与计费保留期必须有界，不能无限增长。自动化巡检会拿同一份会话连续调用，幂等性必须经得住重复请求，计费数据也要能对上账。割接窗口只有十分钟，修复要能在不打断存量会话的前提下生效，任何状态迁移都得可回放、可核对；计费口径以设备侧上报为准，服务端只做累加与保留，不允许在查询时二次折算。
+硬约束：authorize 与 account_start 必须并发安全，六路各两百次授权后结果全部为 permit、审计恰好一千二百条；同一个 session id 被八个线程同时抢占时只能有一个成功，其余七个拿到 TAC_DUP_SESSION。snapshot 必须返回深拷贝，restore 用它完整替换用户、命令集、会话、审计和计数器，恢复后已关闭的会话仍是关闭状态，恢复快照不能被后续修改污染；恢复后再授权要按快照里的规则判断。资源上限是硬要求，审计保留 max_audit 条、会话上限 max_sessions 条，超出按上面的错误码处理，不能靠无限增长兜底。
 
-验收：go test ./... 的 15 条测试全部通过，不得修改测试、跳过或按固定输入写死；并发与重启场景自行验证；只做本地实现，不涉及上游提交。
+验收：python3 -m pytest -q tests 的 15 条测试必须全部通过；不得修改测试、跳过或用固定输入写死返回值；并发与快照恢复需要自己写脚本验证；只做本地实现，不涉及上游提交。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
