@@ -2,24 +2,20 @@
 
 ## 题面
 
-HTTP/3 网关接入 QPACK 动态表后，压测与灰度阶段暴露出成组问题：peer 把 Connection、Keep-Alive 这类逐跳头塞进动态表，服务端照单全收；authorization、cookie 被压缩进共享表，凭据条目在多个请求间复用；一次请求把表容量撑到协商上限之外，后续解码全部错位；插入条目大小超过容量时表被清空而不是拒绝；队头索引已驱逐仍能查回旧条目；伪头出现在普通头之后、重复 :path、未知 :xxx 都能通过解码；40 个并发插入拿到重复的绝对索引；阻塞流数量不受 MaxBlockedStreams 约束，恶意请求用很少的字节挂住连接；插入计数确认可以回退，也可以确认到尚未插入的位置；取消流后阻塞名额没有释放；重启后动态表、插入计数和阻塞流状态全部丢失。现在重做这层校验，范围是模块 gsb/batch46-safety-d-04 的 http3_qpack_guard.go、类型 QpackGuard，任务类型 Bugfix。
+HTTP/3 网关灰度到 10% 流量后，前端大量请求返回 QPACK_DECOMPRESSION_FAILED。抓包看到解码器还没收到编码器插入的字段，就先把引用这些字段的头部块交给上层；动态表容量从 4096 调到 2048 后，老条目没有及时淘汰，used 一路涨到超过容量；同一个键值被反复插入，表项数量翻了几倍；流被阻塞后计数没有上限，一次攻击打开了上千条阻塞流；重启后编码器的插入计数归零，所有相对索引全部错位。编码器与解码器对动态表的淘汰时机理解也不一致，相对索引换算出来指向了错误字段。修复范围：模块路径 gsb/batch46-safety-d-04，文件 http3_qpack_guard.py，类 QpackGuard，任务类型 Bugfix，异常类 QpackError 携带 code。
 
-保留现有导出错误值，关键入口：NewQpackGuard(settings Settings) *QpackGuard；NewQpackGuardFromSnapshot(settings Settings, data []byte) (*QpackGuard, error)；Insert(name, value string, sensitive bool) (uint64, error)；Lookup(absIndex uint64) (Entry, error)；InsertCount() uint64；DynamicTableSize() uint64；EncodeSection(streamID uint64, fields []HeaderField) (uint64, error)；DecodeSection(streamID uint64, requiredInsertCount uint64) error；AcknowledgeSection(streamID, insertCount uint64) error；CancelStream(streamID uint64) error；SetCapacity(capacity uint64) error；Stream(streamID uint64) (StreamState, error)；Snapshot() ([]byte, error)；Counters() Stats。
+接口：QpackGuard(*, capacity: int = 4096, max_capacity: int = 8192, max_blocked: int = 8)、set_capacity(capacity: int) -> dict、insert(name: str, value: str) -> dict、lookup_absolute(index: int) -> dict、lookup_relative(index: int) -> dict、encode(headers: Sequence[Sequence[str]]) -> dict、decode(block: Mapping[str, object]) -> dict、open_stream(stream_id: str, *, required_insert_count: int) -> dict、acknowledge(stream_id: str, section_ack: int) -> dict、unblock(stream_id: str) -> dict、blocked_streams() -> list[str]、table_state() -> dict、snapshot() -> dict、restore(payload: Mapping[str, object]) -> dict、metrics() -> dict。
 
-动态表要求：字段名必须非空、全小写、不以冒号开头，且不能是 connection、keep-alive、transfer-encoding 等逐跳头，否则返回 ErrFieldInvalid；sensitive 为真返回 ErrSensitiveField；条目大小按名称加值加 32 字节计算，超过当前容量返回 ErrEntryTooLarge 且表保持不变；容量不足时从最旧条目开始驱逐，插入返回连续递增的绝对索引；查询未来索引返回 ErrNoEntry，已驱逐索引返回 ErrEvicted；SetCapacity 高于协商上限返回 ErrCapacityExceeded，降低容量时必须驱逐到装得下。
+故障与边界：一、表项大小等于名称字节数加值字节数加 32，绝对索引从 0 单调递增，insert 返回 index、size、used、evicted、insert_count。二、完全相同的名称和值再次 insert 返回 status duplicate，复用原索引，不增加 insert_count，duplicates 加一；去重只针对当前仍在表内的键值，条目被淘汰后可以重新插入。三、单条表项大于当前容量按 QPACK_ENTRY_TOO_LARGE 拒绝且表不变；容量不足时从最旧条目开始淘汰，evicted 返回条数。四、set_capacity 只接受 0 到 max_capacity，越界按 QPACK_CAPACITY 且容量不变；缩小容量要立即淘汰到 used 不超过新容量。五、lookup_absolute 对负数、bool、超出 insert_count 的索引按 QPACK_INDEX；已被淘汰的条目按 QPACK_EVICTED；lookup_relative 的 0 表示最新一条，换算后越界同样按 QPACK_INDEX。六、encode 对表里已有的字段复用索引，缺失的字段先插入；返回 required_insert_count 与每条的 name、value、index、relative、literal，literal 表示该字段是本次新插入的。七、decode 在 required_insert_count 大于当前 insert_count 时按 QPACK_BLOCKED 拒绝，不能返回部分头部；结构缺字段按 QPACK_BLOCK_INVALID；引用已淘汰条目按 QPACK_EVICTED；解码失败不能污染已有表项和流状态。八、open_stream 的 required_insert_count 超过当前插入数时进入 blocked，阻塞流总数达到 max_blocked 后新流按 QPACK_BLOCKED_LIMIT 拒绝且不登记。九、unblock 只对已阻塞且所需插入数已满足的流生效，否则 QPACK_NOT_READY；blocked_streams 按名称排序返回。十、acknowledge 对未知流按 QPACK_STREAM_UNKNOWN，section_ack 超过 insert_count 或小于上次确认值按 QPACK_ACK_INVALID；重复 stream_id 按 QPACK_STREAM_EXISTS。十一、snapshot 保存容量、插入计数、表项、流状态与计数器，restore 原子且校验表项大小与 used，超过容量或不一致按 QPACK_SNAPSHOT_INVALID，失败时现有表不变。十二、metrics 给出 inserts、duplicates、evictions、encoded、decoded、blocked_count；table_state 按插入顺序返回条目。
 
-字段段要求：伪头只允许 :method、:path、:scheme、:authority、:status，必须全部位于普通头之前且不得重复，名称必须小写，否则返回 ErrFieldInvalid；普通头同样校验小写与逐跳规则；authorization、cookie、proxy-authorization 永远不能进入动态表，只作为字面量并累加 SensitiveFields；其余普通字段若表中没有同名同值则插入，已存在则复用，EncodeSection 返回编码时的插入计数；重复编码同一组字段不得产生新条目。
+硬约束：插入、淘汰、索引查询与流状态在同一把锁内完成，多线程并发插入 160 条必须得到 160 个不同绝对索引且 used 不超容量；恢复后新插入必须接着快照的 insert_count 继续编号，旧块仍能按原索引解码。
 
-阻塞与确认：DecodeSection 在 requiredInsertCount 大于当前插入计数时返回 ErrBlocked，并把流标记为 blocked；当前阻塞流数达到 MaxBlockedStreams 时再阻塞新流返回 ErrBlockedLimit，且被拒绝的流不得留痕；所需插入补齐后再次 DecodeSection 必须成功并移除阻塞标记；确认计数不得小于该流上次确认值（ErrAckRegression），也不得超过当前插入计数（ErrAckFuture），相同值重复确认必须幂等；CancelStream 释放阻塞名额并删除流状态，未知流返回 ErrStreamNotFound。Stream 返回的 StreamState 要包含 StreamID、RequiredInsertCount、Acknowledged、Blocked、Sections；Counters 的 Inserted、Evicted、FieldsRejected、SensitiveFields、BlockedRejected、SectionsEncoded、SectionsDecoded、BlockedStreams、Cancelled、Acks 必须逐项对应实际操作，BlockedStreams 是当前阻塞流数而不是累计值。
-
-并发与恢复：并发插入必须得到互不重复的连续绝对索引，表大小与插入计数一致。Snapshot 必须保存动态表、插入计数、容量、确认进度、阻塞流和计数器，恢复后旧条目仍可查询、阻塞流仍占名额并在补齐插入后解除；损坏快照返回 ErrSnapshot。
-
-验收：go test ./... 的 15 条测试全部通过；不得修改或跳过测试、不得按固定输入硬编码；并发与重启场景自行验证；只做本地实现。
+验收：python3 -m pytest -q tests 的 15 条必须全过；不得改测试、不得跳过、不得按固定输入写死。并发与重启场景自行验证；只做本地实现，不涉及其他目录。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -27,4 +23,4 @@ go test ./...
 - domain: 安全
 - sub: 网络与通信安全
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
