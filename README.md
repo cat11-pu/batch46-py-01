@@ -2,18 +2,33 @@
 
 ## 题面
 
-会话服务上线本地加密令牌后，风控连续收到投诉：被登出的用户拿着旧 token 仍能访问账本接口，撤销表根本没有生效；前端重复调用撤销接口时返回 500，用户看到退出失败；签发侧也没有限速，一个脚本一分钟 mint 了数万枚 token，把密钥服务打满；一次密钥轮换后旧 key 被立即删除，尚未过期的 token 全部验不过；测试环境里把 token 中间几位改掉后居然也能通过。运维临时回滚了令牌版本才恢复，但代价是所有在线会话被强制重新登录，风控要求一周内补齐撤销与限速，而撤销量在高峰期骤增时服务内存也跟着上涨。请在模块 gsb/batch46-safety-b-04 的 paseto_v4_guard.go 中修复类型 PasetoGuard，任务类型 Bugfix，令牌格式固定为 v4.local.<kid>.<sealed>，加解密由注入的 Sealer 完成。
+移动端灰度发版后，客服陆续收到“刚登录就掉线”的反馈：网关用的本地令牌库在上次重构里把 footer 当成了纯展示字段，改一个租户名也能通过校验；更严重的是轮换密钥时旧密钥被立刻删除，正在刷新的客户端全部 401，回滚后又被安全同学发现旧令牌还能重放。审计日志里同一条 jti 在十分钟内被兑换了四次，而令牌大小没有上限，有人用超长 claims 把校验线程拖到超时。任务在 `gsb/batch46-safety-b-04`，文件 `paseto_v4_guard.py`，任务类型 Bugfix，修 `PasetoGuard`，签发、校验、轮换、吊销四条路径共用同一份内存状态。
 
-需要保持的接口：NewPasetoGuard(cfg Config, sealer Sealer) *PasetoGuard；NewPasetoGuardFromSnapshot(cfg Config, sealer Sealer, data []byte) (*PasetoGuard, error)；AddKey(k Key) error；RotateKey(k Key, now time.Time) error；Mint(c Claims, now time.Time) (string, error)；Verify(token string, now time.Time) (Claims, error)；Revoke(jti string, now time.Time) error；IsRevoked(jti string, now time.Time) (bool, error)；PruneRevoked(now time.Time) int；ActiveKey(now time.Time) (string, error)；Snapshot() ([]byte, error)。
+公开接口（与骨架一致）：`__init__(self, *, key, key_id="k1", now=0, max_token_bytes=1024)`；`issue(self, claims, *, footer=None, implicit=None, ttl=600, now=None) -> str`；`verify(self, token, *, implicit=None, audience=None, max_age=None, single_use=False, require_footer=None, now=None) -> dict`；`peek(self, token) -> dict`；`revoke(self, jti, *, expires_at=None, now=None) -> dict`；`rotate_key(self, *, key_id, key=None, grace=300, now=None) -> dict`；`retire_key(self, key_id, *, now=None) -> dict`；`keyring(self) -> list`；`sweep_revocations(self, *, now=None) -> int`；`stats(self) -> dict`；`audit_log(self) -> list`；`snapshot(self) -> dict`；类方法 `restore(cls, state)`。
 
-故障与边界：1) Subject、Issuer、Audience、JTI 任一为空，或 ExpiresAt 不晚于 IssuedAt 时，Mint 返回 ErrInvalidClaims，空 JTI 不能绕过撤销表；2) issuer 与 audience 和配置不符分别返回 ErrIssuerMismatch、ErrAudienceMismatch；3) 有效期超过 MaxTTL 返回 ErrTokenLifetime，不做静默截断，过期时间由调用方提供，但服务端必须自己再判一次；4) 每个 MintWindow 最多 MintLimit 次，超限返回 ErrRateLimited，窗口滚动后恢复，限速按 guard 维度统计而不是按进程随意清零；5) Verify 要求 token 恰好四段且前缀为 v4.local，kid 未注册返回 ErrKeyNotFound，key 过了 RetireAt 返回 ErrKeyExpired，密文被改或无法解封返回 ErrInvalidToken，解析失败不能把原始密文当明文继续使用，解封失败一律按非法令牌处理，不能泄露内部错误；6) 过期返回 ErrTokenExpired，NotBefore 未到返回 ErrTokenNotYetValid，ClockSkew 内放行；7) RotateKey 让新 key 立即成为 ActiveKey，旧 key 停止签发但在 RetireAt 前仍能验旧 token，新 key 非法时旧 key 不得改动并返回 ErrKeyInvalid，轮换是原子操作，不能留下半新半旧的两套 key；8) Revoke 幂等，重复调用返回 nil，撤销后 Verify 返回 ErrRevoked，IsRevoked 返回 true，撤销记录超过 RevocationTTL 后由 PruneRevoked 清理，清理后同一 token 重新通过，记录要按 TTL 回收而不是永久占用内存，撤销只针对 jti，同一 subject 的其他令牌不受影响；9) 二十个并发 Mint 在 MintLimit=5 时只能成功 5 个，其余必须是 ErrRateLimited；10) Snapshot 保存 key、撤销表和当前窗口计数，重启后撤销仍生效，配额继续累计而不是清零，恢复后 KeyCount 保持为 1，ActiveKey 仍指向原来的签发密钥。
+令牌固定四段：`v4.local.<正文>.<footer>`，两段都是无填充的 URL-safe base64。正文用标准库 HMAC-SHA256 之类的对称构造做认证加密，footer 的原始字节也要纳入认证范围；footer 是 JSON 对象且必须含 kid。需要修的点：
 
-并发签发、重启恢复、撤销幂等和配额上限都要一起满足，不能只保证顺序调用的结果；解封失败与业务拒绝要能区分。验收：go test ./... 的 15 条用例必须全部通过；不得修改测试、跳过用例或按固定输入写死；并发、重启和轮换场景要自行验证；只做本地实现，不涉及上游提交。
+1. `issue` 复制传入 claims，不修改调用方字典；iat 取 now，exp 取 claims 里已有的值，否则取 now 加 ttl；没有 jti 时生成一个非空字符串。
+2. 签发结果和待校验令牌长度超过 max_token_bytes 都报 PASETO_SIZE_LIMIT，校验时先判长度再解析。
+3. 段数不是四段、前两段不是 v4 与 local、base64 解不开、footer 不是 JSON 对象、正文缺 exp/iat/jti，统一报 PASETO_FORMAT。
+4. footer 里的 kid 未知、已退役或宽限期已过，报 PASETO_UNKNOWN_KEY；正文或 footer 任意字节被改、密钥不对、解密或正文解析失败，统一报 PASETO_INTEGRITY，不能把底层异常直接抛给调用方。
+5. 隐式断言不写进令牌明文，而是把它的摘要放进认证过的正文；校验时先验完整性再比对摘要，传入值与签发时不一致（包括该传没传）报 PASETO_IMPLICIT。
+6. 时间校验顺序：now 大于等于 exp 报 PASETO_EXPIRED；claims 带 nbf 且 now 小于 nbf 报 PASETO_NOT_YET_VALID；传入 max_age 且 now 减 iat 大于 max_age 报 PASETO_TOKEN_TOO_OLD。
+7. 传入 audience 时，claims 的 aud 可以是字符串或列表，交集为空报 PASETO_AUDIENCE；未传 audience 不校验。
+8. `revoke` 写入 jti 与 expires_at（缺省 now 加 3600），在 now 小于 expires_at 期间校验报 PASETO_REVOKED；`sweep_revocations` 删除 expires_at 小于等于 now 的记录并返回条数。
+9. single_use 校验成功后把 jti 记入已消费集合，之后无论是否再传 single_use 都报 PASETO_REPLAY；不传 single_use 的校验只读该集合、不写入。
+10. `rotate_key` 让旧密钥进入宽限期，expires_at 为 now 加 grace，新密钥立即成为 current，返回 key_id、previous、expires_at；宽限期内旧令牌仍可验，边界等于 expires_at 时拒绝；`keyring` 按插入顺序返回 key_id、status（current 或 grace）、expires_at，不得返回密钥材料。
+11. 并发硬约束：同一个 jti 被八个线程同时以 single_use 校验，只能有一个成功，其余七个全部 PASETO_REPLAY，verified 计数只能加一，重放集合的读写必须原子。
+12. 快照恢复：snapshot 必须可 JSON 序列化，restore 之后当前密钥、宽限期、已吊销 jti、已消费 jti 与计数器全部延续；恢复后旧令牌在宽限期内仍可验，已吊销与已重放的令牌不能复活。
+
+stats 至少包含 issued、verified、denied、replays 四个计数；audit_log 记录校验结果与错误码，但不得写入密钥材料。require_footer 传入时按子集比对，缺键或值不等报 PASETO_FOOTER_MISMATCH。
+
+验收：在项目根执行 `python3 -m pytest -q tests`，15 条必须全部通过；不得修改测试、跳过或按固定输入写死；并发与重启恢复场景请自行验证；只做本地实现，除 pytest 外不引入第三方依赖。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -21,4 +36,4 @@ go test ./...
 - domain: 安全
 - sub: 身份认证
 - type: Bugfix
-- difficulty: 地狱
+- difficulty: 困难
