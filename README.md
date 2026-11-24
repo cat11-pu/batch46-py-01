@@ -2,32 +2,30 @@
 
 ## 题面
 
-数据中心的合规审计给了我们一张整改单：过去两个月里有 37 台机器上报的启动度量证明，其中若干份被原样重放了不止一次，还有两台在更换主板后依然用旧证明通过了校验，另有一台机器的固件被降级后证明照样被接受。现在的校验逻辑把证明当成一次性校验函数，既没有记录服务端下发的随机数，也没有把度量值和每台机器的基准策略核对，TPM 时钟是不是往前走更是没人管。整改要求我们重写校验组件：模块路径 gsb/batch46-safety-b-07，文件名 tpm_quote_guard.go，类型名 TpmQuoteGuard，任务类型 Bugfix。
+一批边缘节点升级固件后，远程证明通过率从九成八掉到六成，运维抽查发现其中一半是误杀：PCR 列表里的 10 和 2 被按字符串排序，摘要永远对不上；基线轮换之后老 AK 仍按旧版本通过校验；验证服务重启后同一个 nonce 又被发了一遍；坏签名请求把 nonce 消耗掉，真节点重试反而被拒。更糟的是攻击者拿一台已经落地的旧 quote 反复重放，计数器没有单调约束，十分钟内把三台机器刷成 trusted。请修 `gsb/batch46-safety-b-07` 下的 `tpm_quote_guard.py`，暴露类型 `TpmQuoteGuard`，任务类型 Bugfix，只改这一个文件，不得改测试。
 
-骨架里的公开方法有：NewTpmQuoteGuard(Config) *TpmQuoteGuard；RegisterAK(AK) error；RevokeAK(tenantID, name string) error；SetPolicy(PCRPolicy) error；Policy(tenantID, nodeID string) (PCRPolicy, error)；IssueNonce(tenantID, nodeID string, now time.Time) (string, error)；Verify(Quote, time.Time) (Verdict, error)；LastVerdict(tenantID, nodeID string) (Verdict, error)；Evaluations() int；Snapshot() ([]byte, error)；NewTpmQuoteGuardFromSnapshot(Config, []byte) (*TpmQuoteGuard, error)。
+题目已提供签名工具 `quote_signature(secret: str, node_id: str, nonce: str, pcr_digest: str, counter: int) -> str`，实现为 sha256("节点|nonce|pcr_digest|计数器|secret")，直接用它验签即可。保持这些公开接口：
 
-现场必须逐条满足的行为：
+- `define_profile(name: str, *, required_pcrs: tuple[int, ...], golden: dict[int, str], min_counter: int = 0) -> dict`
+- `rotate_profile(name: str, *, required_pcrs: tuple[int, ...] | None = None, golden: dict[int, str] | None = None, min_counter: int | None = None) -> dict`
+- `enroll_ak(ak_name: str, *, secret: str, profile: str, pcrs: dict[int, str], pubkey_id: str | None = None, now: str = ...) -> dict`
+- `revoke_ak(ak_name: str, *, reason: str = "manual") -> dict`
+- `issue_nonce(node_id: str, *, ttl_seconds: int | None = None, now: str = ...) -> dict`
+- `verify_quote(node_id: str, *, ak_name: str, quote: dict, now: str = ...) -> dict`
+- `trust_state(node_id: str) -> dict`、`sweep(now: str = ...) -> dict`、`snapshot() -> dict`、`restore(snap: dict) -> None`、`audit(limit: int = 20) -> list`、`stats() -> dict`
 
-1. 只有服务端为这台机器签发、且未超过 NonceTTL 的随机数才能用；同一个随机数第二次进来报 ErrNonceReplay；拿 A 机器的随机数给 B 机器用属于未知随机数 ErrNonceUnknown。
-2. 证明里的度量值必须逐项等于 SetPolicy 里的基准值，缺项或少项都算 ErrPCRMismatch；一份证明携带的 PCR 条目数超过 MaxPCRsPerQuote 时按 ErrQuoteInvalid 拒绝，空摘要同样按结构错误处理。
-3. 签名密钥按租户注册，重复注册同名密钥报 ErrAKDuplicate，吊销后报 ErrAKRevoked，且重新注册不能复活；用别的租户的密钥名来证明要报 ErrTenantMismatch 而不是未知密钥。
-4. 证明签名校验失败报 ErrSignatureInvalid；AttestedAt 偏离当前时间超过 MaxQuoteAge 报 ErrQuoteStale，偏早和偏晚都算。
-5. 每台机器的 TPM Clock 必须严格大于上一次通过校验时的值，倒退报 ErrClockRollback，与基线相等也算倒退。
-6. 结构不完整（租户、节点、密钥名、随机数、时间戳缺失，或 PCR 为空）一律 ErrQuoteInvalid；尚未配置基准策略的节点报 ErrPolicyMissing。
-7. 通过的证明返回 Verdict，带上节点、固件版本、Clock、实际核对的 PCR 数量和校验时刻；LastVerdict 能取回最近一次结果，没有结果时 ErrNoVerdict。
-8. 被拒绝的证明不得消耗随机数、不得推进时钟基线、不得覆盖已有 Verdict，也不计入 Evaluations。
-9. IssueNonce 遇到空租户或空节点返回 ErrQuoteInvalid；Policy 返回基准策略的副本，调用方改动副本不能影响已安装的策略。
-10. 每通过一次校验 Evaluations 加一；快照恢复后继续累计，不清零。
-11. 快照要带回 AK 及其吊销标记、基准策略、待用与已用随机数、每台机器的时钟基线和最近一次 Verdict，恢复后重放与时钟倒退继续被拦住。
+构造参数 `nonce_ttl_seconds`、`nonce_cap`、`failure_budget`、`failure_window_seconds`、`audit_capacity` 默认 300、4、3、60、128。
 
-硬约束：同一随机数的两个并发校验只能有一个成功，检查与标记必须落在同一个临界区内；随机数与已用表按 TTL 清理，不能让内存随节点数量和时间线性膨胀；快照必须自包含，恢复时不依赖任何外部状态。
+故障与边界：profile 的 required_pcrs 必须是非空且不重复的整数列表，golden 的键集合必须与之一致，PCR 摘要必须是 64 位十六进制，min_counter 不得为负，否则 `TQ_PROFILE_INVALID` 或 `TQ_PCR_INVALID`；重名报 `TQ_PROFILE_DUPLICATE`，轮换不存在的基线报 `TQ_PROFILE_UNKNOWN`，轮换成功版本号加一。注册 AK 时 secret 必须是 64 位十六进制否则 `TQ_AK_SECRET_INVALID`，基线不存在报 `TQ_PROFILE_UNKNOWN`，缺少基线要求的 PCR 报 `TQ_PCR_REQUIRED_MISSING`，PCR 摘要非法报 `TQ_PCR_INVALID`，重名报 `TQ_AK_DUPLICATE`，注册要记下当时的基线版本。nonce 按 `sha256("<node>|<seq>")` 取前 32 位生成，seq 从 1 起单调递增；ttl 非正报 `TQ_TTL_INVALID`，单节点未使用 nonce 最多 4 个，超出报 `TQ_NONCE_CAP`，返回值含 node、nonce、seq、expires_at。nonce 过期后再次提交报 `TQ_NONCE_EXPIRED` 并从待用集合移除，已经成功用过或已判失败消耗掉的 nonce 再出现报 `TQ_NONCE_CONSUMED`，从未签发过的报 `TQ_NONCE_UNKNOWN`，sweep 清理过期 nonce 并返回 `{"nonces": n}`。quote 缺字段或 counter 不是整数报 `TQ_QUOTE_INVALID`，缺少基线要求的 PCR 报 `TQ_PCR_MISSING`，摘要格式错报 `TQ_PCR_INVALID`。签名不匹配报 `TQ_SIGNATURE_INVALID`，且这次失败不能消耗 nonce，节点必须能用同一个 nonce 重试成功。PCR 摘要按所有条目 `序号:摘要` 用竖线连接、序号按数值升序后取 sha256，算出来与 quote 声明的不一致报 `TQ_PCR_DIGEST_MISMATCH` 并消耗 nonce；与 golden 值不一致报 `TQ_PCR_MISMATCH` 并置为不可信。计数器必须严格大于该 AK 上次通过的值，否则 `TQ_COUNTER_REPLAY`；低于基线 min_counter 报 `TQ_COUNTER_STALE`；两者都消耗 nonce。60 秒窗口内失败达到 3 次后，该节点后续请求一律先报 `TQ_RATE_LIMITED`。AK 被吊销后报 `TQ_AK_REVOKED` 并立即取消信任，重复吊销幂等；AK 记录的基线版本落后于当前版本时报 `TQ_ENROLLMENT_STALE`。校验通过返回 status="trusted" 与 counter、profile、pcr_digest，并让 generation 加一。
 
-验收：go test ./... 跑满 15 条且全部通过；不允许改测试、跳过用例或针对固定输入写死结果；并发与重启场景请在本地自行验证；改动只留在当前模块。
+硬约束：snapshot/restore 必须可 JSON 序列化，保留每个 AK 的计数器、每个节点的 nonce 序号与已消费 nonce 集合，版本号不认识报 `TQ_SNAPSHOT_INVALID`，generation 比当前小的旧快照报 `TQ_SNAPSHOT_STALE`，恢复后不允许 nonce 重发或计数器回退；12 个线程用同一个计数器值并发提交各自 nonce 时，只能有 1 个通过，其余全部 `TQ_COUNTER_REPLAY`；所有判定在一把可重入锁内完成，失败路径不得留下半个已消费状态。
+
+验收：`python3 -m pytest -q tests` 的 15 条必须全过，不得改测试、跳过或按固定输入写死；并发与重启恢复场景自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -35,4 +33,4 @@ go test ./...
 - domain: 安全
 - sub: 身份认证
 - type: Bugfix
-- difficulty: 困难
+- difficulty: 地狱
