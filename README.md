@@ -2,24 +2,20 @@
 
 ## 题面
 
-邮件网关的 STARTTLS 策略上线后，安全运营复盘了三起真实事故：上游 MTA 的 EHLO 应答里 STARTTLS 被中间设备删掉，网关仍然按明文继续投递，用户的 AUTH 凭据直接出现在链路上；一台主机返回的能力行里混入 CRLF，被原样拼进下一条应答；能力缓存一小时不失效，主机早已关闭 STARTTLS 却仍按旧缓存放行；客户端重复下发 STARTTLS 时网关每次都重新协商；TLS 1.0 握手被接受；AUTH 在握手前就执行；主机只声明 AUTH PLAIN，客户端却用 LOGIN 通过；同一会话可以认证两次；收件人列表大小写不同被当成多个地址重复投递，并且没有数量上限；网关重启后能力缓存和会话的 TLS 状态全部丢失，客户端又回到明文重试。现在补齐这层防护，范围是模块 gsb/batch46-safety-d-02 的 smtp_starttls_guard.go、类型 StarttlsGuard，任务类型 Bugfix。
+邮件网关上线 STARTTLS 强制策略后，安全组在流量回放里发现三类问题：对端 EHLO 里根本没有 STARTTLS，网关仍把邮件以明文投递；某银行域名昨天还宣布支持 STARTTLS，今天被中间设备抹掉能力项，网关只当成普通明文会话；还有会话在 EHLO 之前就上报 TLS 版本，状态机直接接受并把密文参数写进日志。值班组临时把这套状态机塞进网关进程后，明文会话在 EHLO 之后直接发 MAIL FROM，策略引擎也没有拦截；能力缓存还按连接而不是按域名记，换一条连接就重新信任对端。修复范围：模块路径 gsb/batch46-safety-d-02，文件 smtp_starttls_guard.py，类 StarttlsGuard，任务类型 Bugfix，异常类 StarttlsError 携带 code。
 
-保留现有导出错误值与状态常量，关键入口：NewStarttlsGuard(policy Policy) *StarttlsGuard；NewStarttlsGuardFromSnapshot(policy Policy, data []byte) (*StarttlsGuard, error)；Advertise(host string, caps []string, now time.Time) error；Capabilities(host string, now time.Time) (Capabilities, error)；Negotiate(host string, now time.Time) ([]string, error)；BeginSession(id, host string, now time.Time) (Session, error)；RequireStartTLS(sessionID string, now time.Time) error；MarkTLS(sessionID, version string, now time.Time) error；Authenticate(sessionID, mechanism, user string) error；CheckRecipients(sessionID string, rcpts []string) ([]string, error)；Snapshot() ([]byte, error)；Counters() Stats。
+接口：StarttlsGuard(*, cache_ttl: int = 600, max_sessions: int = 64)、set_policy(domain: str, *, mode: str = "require", min_version: str = "TLSv1.2") -> dict、policy_for(domain: str) -> dict、begin_session(session_id: str, *, peer_ip: str, ehlo_domain: str, now: int = 0) -> dict、observe_ehlo(session_id: str, capabilities: Sequence[str], *, now: int = 0) -> dict、decide(session_id: str, now: int = 0) -> dict、mark_tls(session_id: str, *, version: str, cipher: str) -> dict、cache_lookup(domain: str, now: int) -> dict、downgrade_report(limit: int = 50) -> list[dict]、close_session(session_id: str) -> bool、snapshot() -> dict、restore(payload: Mapping[str, object]) -> dict、metrics() -> dict。
 
-能力处理要求：主机名或任一能力行包含 CR 或 LF 时返回 ErrInjection；能力行去重后按首次出现顺序缓存；主机从未登记返回 ErrCapabilityMissing，超过 CapabilityTTL 返回 ErrCapabilityStale；Negotiate 把 STARTTLS 放在第一位，丢弃 XTRN 等不支持的行并去重；策略要求 TLS 而主机未声明 STARTTLS 时返回 ErrDowngrade 并累加 DowngradesRejected。
+故障与边界：一、策略只有 require 和 opportunistic 两种，其他值按 SMTP_POLICY_INVALID；域名空按 SMTP_DOMAIN_INVALID；min_version 只认 TLSv1.3 与 TLSv1.2，其余按 SMTP_TLS_VERSION。二、未配置域名默认 require 加 TLSv1.2；策略按域名精确匹配，不做后缀通配，未注册子域不会继承父域设置。三、EHLO 能力项先 strip 再转大写去重排序，STARTTLS 按首词识别；能力项里带参数（如 SIZE 1000）时只取首词判断，重复项和大小写差异不能影响结果；空列表按 SMTP_EHLO_EMPTY，非字符串项按 SMTP_EHLO_INVALID。四、require 策略下缺少 STARTTLS，决策为 reject、code 为 SMTP_STARTTLS_MISSING，rejections 只加一次，重复 EHLO 不能把拒绝计数刷高。五、缓存记录某域名曾支持 STARTTLS 后，若在 cache_ttl 内再次看到能力项缺失，必须判为 SMTP_STARTTLS_STRIPPED，即使策略是 opportunistic，并写入降级报告。六、同一会话重复上报完全相同的能力项返回 status duplicate，不重复计数，也不能产生第二条降级记录。七、状态机只允许 begun 到 ehlo 到 tls；EHLO 之前 mark_tls 或 decide、TLS 建立后再 EHLO，都按 SMTP_STATE_ORDER 拒绝。八、mark_tls 的版本低于策略下限按 SMTP_TLS_VERSION，密文为空按 SMTP_TLS_CIPHER，失败时状态仍停在 ehlo 可重试。九、cache_lookup 在 now 减写入时刻大于 cache_ttl 时返回 hit 为 False、starttls 为 None，命中时返回 age；缓存未命中或过期时按从未见过该域名处理，不能沿用旧结论。十、会话号重复按 SMTP_SESSION_EXISTS，超过 max_sessions 按 SMTP_SESSION_LIMIT，close_session 返回是否真的关闭，关闭后调用按 SMTP_SESSION_MISSING；会话建立后域名为只读，后续 EHLO 不能换域名绕过策略。十一、downgrade_report 倒序返回，limit 必须在 1 到 500，否则 SMTP_BAD_LIMIT。十二、snapshot 必须保存策略、能力缓存、活动会话状态与计数器；restore 原子，坏版本或坏结构按 SMTP_SNAPSHOT_INVALID 且状态不变。metrics 至少给出 sessions_started、ehlo_observed、tls_established、rejections、downgrades、duplicates、active_sessions。
 
-会话要求：BeginSession 建立 new 状态，重复会话号、重复 STARTTLS、握手前重复操作都返回 ErrSessionState；RequireStartTLS 对同一会话只能成功一次并进入 greeted，会话记录 StartTLSIssued 与 TLSVersion；主机未声明 STARTTLS 返回 ErrDowngrade；MarkTLS 只在 greeted 状态可用，版本低于 MinTLSVersion 返回 ErrTLSVersion，成功后进入 tls 并累加 TLSCompleted；Authenticate 在握手前调用返回 ErrPlaintextAuth 并累加 PlaintextAuthRejected，机制不在主机 AUTH 行中返回 ErrAuthMechanism，成功后进入 authenticated，再次认证返回 ErrSessionState；DropSession 之后所有操作返回 ErrSessionNotFound；CheckRecipients 仅在 tls 或 authenticated 状态可用，按大小写不敏感去重并保留首次拼写与顺序，去重后超过 MaxRecipients 返回 ErrRecipientLimit 且不写入会话。
+硬约束：所有会话状态与缓存读写在一把锁内完成，多线程各自建会话时计数不得丢失；恢复后会话能继续 decide 和关闭，缓存命中结果与恢复前一致。
 
-并发与恢复：同一会话两个并发 RequireStartTLS 必须恰好一个成功、另一个得到 ErrSessionState。Snapshot 必须保存能力缓存、会话（含 TLS 版本与状态）和计数器；恢复后缓存仍按原始 ReceivedAt 计算新鲜度，处于 tls 的会话可以直接继续认证；损坏快照返回 ErrSnapshot。
-
-补充要求：Session 返回会话副本，调用方修改收件人切片不得影响内部状态；能力行保存前要裁剪首尾空白并按原顺序去重；AUTH 机制匹配不区分大小写，主机没有 AUTH 行时任何机制都返回 ErrAuthMechanism；TLS 版本按主次版本号数值比较，无法解析的版本一律视为不达标；MaxSessions 为 0 表示不限制，超过上限返回 ErrSessionLimit；DropSession 之后用同一会话号重新 BeginSession 必须成功。
-
-验收：go test ./... 的 15 条测试全部通过；不得修改或跳过测试、不得按固定输入硬编码；并发与重启场景自行验证；只做本地实现。
+验收：python3 -m pytest -q tests 的 15 条必须全过；不得改测试、不得跳过、不得按固定输入写死。并发与重启场景自行验证；只做本地实现，不涉及其他目录。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
