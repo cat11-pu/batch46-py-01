@@ -2,45 +2,20 @@
 
 ## 题面
 
-云网关联调时发现，封装网关会把带未知 critical 选项的 Geneve 报文当成普通流量放行，报文进了租户 VPC 后无人处理又原路丢弃，业务侧表现为持续几十秒的黑洞；同一批抓包里还有选项长度越界、同一个 class/type 重复出现、选项值超过规则上限却照收的情况。更麻烦的是 VNI 归属表没有租户校验，B 租户构造的 VNI 可以直接落到 A 租户的段里，两个租户的网关都以为自己才是合法入口。
+周二上午，跨机房的 Geneve 隧道升级后，OAM 检测帧开始把带了未知选项的包整条丢掉，可同一个未知选项在控制面看又完全正常；另一批包因为选项下发顺序不同被判定摘要不一致，补偿任务重复跑了两遍，计数直接翻倍。更严重的是某个非关键选项长度超限后没有被拦住，接收端解析越界，隧道口开始随机重启。升级窗口只剩一个小时，回滚脚本又依赖旧的选项顺序。请修 `gsb/batch46-safety-c-08` 下的 `geneve_option_guard.py`，核心类型 `GeneveGuard`，任务类型 Bugfix；所有校验失败统一抛 `GeneveError(code, detail=None)`，调用方按 `code` 处理。
 
-请修复 gsb/batch46-safety-c-08 中 geneve_option_guard.go 的 GeneveGuard，任务类型 Bugfix，只改本地实现。
+需要保留这些公开方法：`__init__(self, *, max_options: int = 8, max_option_bytes: int = 128, allowed_classes: Iterable[int] = (0x0108,), cache_capacity: int = 64) -> None`、`register_option(self, opt_class: int, opt_type: int, *, critical: bool = False, max_len: int = 16, encoding: str = "raw") -> dict`、`unregister_option(self, opt_class: int, opt_type: int) -> bool`、`list_options(self) -> list[dict]`、`parse(self, packet: dict, *, request_id: str | None = None) -> dict`、`audit(self, packet: dict) -> dict`、`cache_size(self) -> int`、`clear_cache(self) -> int`、`stats(self) -> dict`、`snapshot(self) -> dict`、`restore(self, state: dict) -> None`。
 
-需要遵守的公开接口（签名不得改动）：
+具体故障与边界：一、packet 必须含 version、vni、options，version 只接受 0，vni 合法范围是 1 到 16777215，否则分别报 `GENEVE_BAD_VERSION`、`GENEVE_BAD_VNI`；options 不是列表报 `GENEVE_BAD_PACKET`。二、注册选项时 class 必须在 0 到 65535，type 在 0 到 255，max_len 在 0 到 1024，encoding 只认 raw、utf8、ipv4，非法组合报 `GENEVE_BAD_REGISTRATION`；重复注册同一键要覆盖旧记录，`list_options` 按 class 和 type 升序返回，解绑返回布尔值。三、选项个数超过 `max_options` 报 `GENEVE_OPT_COUNT`；每个选项占 4 加 value 长度个字节，总和超过 `max_option_bytes` 报 `GENEVE_OPTS_OVERFLOW`，这两项都在逐项字段校验之前判定，避免先解析再溢出。四、同一 class 和 type 在一次报文里出现两次报 `GENEVE_OPT_DUP`。五、class 不在 allowed_classes 或 type 未注册时，critical 为真报 `GENEVE_CRITICAL_UNKNOWN`，critical 为假则跳过，把 `[class, type]` 记入 skipped，不算失败。六、已注册选项的 critical 位必须与注册表一致，否则报 `GENEVE_CRITICAL_MISMATCH`。七、value 长度超过注册的 max_len 报 `GENEVE_OPT_LEN`，空 value 报 `GENEVE_OPT_EMPTY`。八、encoding 为 utf8 时必须能按 UTF-8 解码，encoding 为 ipv4 时必须恰好 4 字节且能解析成 IPv4 地址，否则报 `GENEVE_OPT_ENCODING`。
 
-- NewGeneveGuard(policy Policy) *GeneveGuard
-- NewGeneveGuardFromSnapshot(policy Policy, data []byte) (*GeneveGuard, error)
-- (*GeneveGuard) ParseHeader(raw []byte) (Header, error)
-- (*GeneveGuard) Validate(h Header, tenantID string) error
-- (*GeneveGuard) RegisterVNI(vni int, tenantID string) error / UnregisterVNI(vni int) error / TenantForVNI(vni int) (string, error)
-- (*GeneveGuard) RegisteredVNIs() []int / ProtocolAllowed(proto uint16) bool
-- (*GeneveGuard) Snapshot() ([]byte, error) / Stats() Stats
+九、成功结果固定含 status、code、version、vni、options、skipped、option_bytes、cached，首次解析 cached 为 False；options 按 class 和 type 排序，每项含 class、type、critical、value（bytes）和 length，skipped 是排序前的二元组列表。十、`audit` 不增加统计也不写缓存，一次返回全部问题，检查顺序是 version、vni、选项数量、总字节，再按选项顺序检查重复、未注册、关键位、长度和编码；结果含 ok、issues、vni、option_bytes。十一、带 request_id 的相同请求返回缓存副本并标 cached=True，不增加 parsed；缓存按 `cache_capacity` 做 LRU 淘汰，返回和保存都要深拷贝，调用方改返回值不能影响后续命中，`cache_size` 与 `clear_cache` 分别返回当前条数和清理条数。十二、`stats` 给出 parsed、accepted、rejected、replayed、skipped_options 和 codes；快照固定含 version、registered、allowed_classes、cache、counters，`restore` 深拷贝并重建注册表与缓存，版本不符报 `GENEVE_STATE_VERSION`。
 
-具体现象与边界：
-
-1. 版本字段只接受 0，出现 1、2、3 时在读取选项之前就返回 ErrVersion；解析结果要给出 Header.VNI 与 Header.Protocol，协议只支持 0x6558 和 0x0800。
-2. 头部第二字节的 optlen 以 4 字节为单位，声明的选项区必须完整出现在报文里，短一字节就返回 ErrMalformed；optlen 上限按字段位宽处理，不能读越界。
-3. 单个选项的 length 同样以 4 字节为单位，选项头加值必须按 4 字节对齐且不得越过声明区域，越界返回 ErrMalformed。
-4. 选项 type 字节最高位是 critical 位，解析后 Option.Critical 单独给出，Option.Type 只保留低 7 位。
-5. 同一个 class/type 在一个头里出现两次即返回 ErrDuplicateOption，判定只看 class 与低 7 位 type，无论两次的 critical 位是否相同。
-6. 选项数量超过 MaxOptions 返回 ErrTooManyOptions；单个选项值超过 MaxValueBytes 返回 ErrOptionTooLong，即使它命中规则也不能豁免。
-7. 规则里的 MaxValueBytes 可以比全局上限更严，命中规则后按更小的值判断，超限同样返回 ErrOptionTooLong。
-8. 未知选项且 critical 为真返回 ErrCriticalOption；未知且非 critical 则跳过并累加 Stats 的 IgnoredOptions，本次校验仍算 Validated。
-9. VNI 可用范围是 1 到 16777214，0、16777215、负数和超 24 位的值返回 ErrVNIRange，不能先登记再报错，失败时现有归属表不得改动。
-10. Validate 时 VNI 未登记返回 ErrVNIUnknown，登记在别的租户名下返回 ErrTenantMismatch，只有归属租户可以通过。
-11. 同一 VNI 被两个租户并发登记时只能有一个成功，失败方拿到 ErrVNIBound；快照恢复后 TenantForVNI 与 RegisteredVNIs 的升序结果要和恢复前一致，登记时间与计数不做保留要求。
-12. 选项计数、值长度与 VNI 归属的检查要在同一把锁下完成，不能出现登记被撤销后仍按旧归属放行。
-
-硬约束：选项数量与单值长度都有硬上限，解析器不能因为对端声明更大的长度就分配更多内存；VNI 登记是排他事务；快照恢复必须保留全部归属关系。
-
-验收：go test ./... 的 15 条测试全部通过；不得修改测试、跳过或用固定输入写死结果；并发与恢复场景自行验证；只做本地实现，不涉及上游提交。
-
-交付：修改后的源码与测试通过记录，附一段简要说明，讲清解析错误与策略拒绝各自使用的错误值。
+硬约束：parse、缓存和统计由同一把可重入锁保护，八个线程并发处理四十个不同 request_id 时，parsed、accepted 和缓存条数必须精确；快照恢复后注册表、允许 class、缓存命中和计数要与恢复前一致；单次解析的工作量受 `max_options` 和 `max_option_bytes` 限制，缓存条数不得超过 `cache_capacity`。验收标准是 `python3 -m pytest -q tests` 的 15 条全部通过；不得改测试、跳过或按固定输入写死，并发与重启恢复自行验证，只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
@@ -48,4 +23,4 @@ go test ./...
 - domain: 安全
 - sub: 网络与通信安全
 - type: Bugfix
-- difficulty: 困难
+- difficulty: 地狱
