@@ -2,33 +2,20 @@
 
 ## 题面
 
-客服转来一条投诉：某办公网里有人用共享账号在代理上同时开了二十多个会话，其中几个连到了内网主机和云主机的元数据地址，日志里只能看到成功的 CONNECT，是谁认证的、传了多少字节一概查不出来。现在要做代理入口的认证与转发防护：模块路径 `gsb/batch46-safety-c-05`，文件 `socks5_auth_guard.go`，类型 `Socks5Guard`，任务类型 Bugfix，骨架方法签名保持不变。
+跨境电商的出口代理集群上个月被扫描器盯上，SOCKS5 入口两天内出现二十多万次认证尝试。安全复盘列出七类问题：认证列表里只要带 no-auth 就真的允许匿名转发；连续输错密码没有锁定，单账号被撞库一晚上；用户名和密码长度不做限制，超长凭据把解析缓冲撑破；BIND 和 UDP ASSOCIATE 命令照样放行，代理被当成反向监听器；目标地址不看白名单，也不拦回环和私网，攻击者用代理打通内网数据库；单用户开会话没有上限，一个账号占满连接池；流量配额只在报表里统计，超额连接不断，月底账单翻了三倍；重复 close 会把在线计数减两次，运维面板出现负数；进程重启后会话表清空，正在跑的抓取任务全部中断；迁移快照把用户密码明文写进文件，被扫描到公开对象存储。
 
-对外接口：`AddUser(username, proof, tenantID string) error` 登记用户；`SetResolver(fn func(host string) ([]string, error)) error` 注入域名解析；`Open(now time.Time) (Session, error)` 开会话；`Greet(sessionID string, gr Greeting, now time.Time) error` 协商认证方式；`Authenticate(sessionID, username, proof string, now time.Time) error` 认证；`Connect(sessionID, host string, port int, now time.Time) (Target, error)` 解析并校验目标；`Transfer(sessionID string, up, down int64, now time.Time) error` 记账；`Close(sessionID string, now time.Time) error`；`Sweep(now time.Time) int`；`Stats() Stats`；`Snapshot() ([]byte, error)` 与 `NewSocks5GuardFromSnapshot(cfg Config, data []byte) (*Socks5Guard, error)` 负责快照恢复。
+范围是 gsb/batch46-safety-c-05 下的 socks5_auth_guard.py，类 Socks5Guard，任务类型 Bugfix，负责用户登记、方法协商、RFC 1929 认证、目标策略、会话与流量配额、快照。公开接口（Python 类型注解）：`Socks5Guard(*, max_sessions: int = 64, require_auth: bool = True, default_max_sessions: int = 4, clock=None)`；`add_user(username: str, password: str, *, max_sessions: int | None = None, quota_bytes: int | None = None, allow_targets: tuple = (), allow_private: bool = False) -> dict`；`set_password(username: str, password: str) -> dict`；`hello(session_id: str, methods: list) -> dict`；`authenticate(session_id: str, username: str, password: str) -> dict`；`connect(session_id: str, cmd: int, host: str, port: int) -> dict`；`record_traffic(session_id: str, *, up: int = 0, down: int = 0) -> dict`；`close(session_id: str) -> dict`；`session(session_id: str) -> dict`；`list_sessions(username: str | None = None) -> list`；`usage(username: str) -> dict`；`expire(now: int | None = None) -> list`；`unlock(username: str) -> dict`；`snapshot() -> dict`；`restore(snapshot: dict) -> None`。策略错误抛 Socks5Error(code, detail)，协商结果用返回值表达。
 
-需要逐条落地的行为：
+故障与边界：一、hello 对未知会话号自动建会话；require_auth 为真时只接受 0x02，客户端没提供就返回 method=0xFF、status=rejected、code=SOCKS_NO_METHOD；require_auth 为假时优先 0x00，其次 0x02；methods 为空或元素越界抛 SOCKS_BAD_METHODS；会话已协商过再 hello 抛 SOCKS_BAD_STATE。二、authenticate 必须在 hello 选中 0x02 之后调用，否则抛 SOCKS_BAD_STATE；未知会话抛 SOCKS_SESSION_UNKNOWN；用户名与密码长度必须在 1 到 255，否则 SOCKS_BAD_CREDENTIAL_FORMAT。三、密码比较必须常量时间；同一用户连续失败三次即锁定 300 秒，第三次失败与锁定期间的正确密码都返回 SOCKS_USER_LOCKED，前两次返回 SOCKS_AUTH_FAILED；expire(now) 解锁到期用户并按字典序返回用户名列表，unlock 手工解锁。四、connect 按固定顺序校验：未知会话抛 SOCKS_SESSION_UNKNOWN；命令不是 0x01 抛 SOCKS_CMD_UNSUPPORTED；地址与端口非法抛 SOCKS_BAD_ADDRESS；随后才看状态，未认证抛 SOCKS_NOT_AUTHENTICATED、已连接抛 SOCKS_ALREADY_CONNECTED、已关闭抛 SOCKS_BAD_STATE。五、host 为空或长度超过 255、port 不在 1 到 65535，一律抛 SOCKS_BAD_ADDRESS。六、allow_targets 非空时按后缀匹配：登记 .example.com 允许 example.com 与任意子域，badexample.com 必须拒绝并抛 SOCKS_TARGET_DENIED。七、目标是 IP 字面量且属于回环、私网、链路本地、保留或组播时，用户没有 allow_private=True 就抛 SOCKS_TARGET_DENIED。八、单用户在线会话数达到 max_sessions（缺省取 default_max_sessions）抛 SOCKS_SESSION_LIMIT；全局在线数达到构造参数 max_sessions 抛 SOCKS_SERVER_BUSY；两个上限先判用户再判全局。九、record_traffic 只对 open 会话生效，否则 SOCKS_NOT_OPEN；up 或 down 为负抛 SOCKS_BAD_TRAFFIC；累计用量超过 quota_bytes 时立即关闭会话、closed_reason 记为 SOCKS_QUOTA_EXCEEDED 并抛同名错误。十、close 第一次返回 status=closed，重复 close 返回 status=noop 与 code=SOCKS_ALREADY_CLOSED，在线计数只减一次；未连接就关闭的会话同样按 closed 处理。十一、session 返回会话快照；usage 返回 sessions（在线）、total（累计连接）、up、down、quota、remaining，remaining 不足时取 0。十二、snapshot 带 version=1，覆盖用户策略、会话、配额用量与锁定状态，但绝不包含密码；restore 后所有密码失效，认证按 SOCKS_AUTH_FAILED 拒绝，必须由 set_password 重新下发；版本非法、会话号重复或会话引用未知用户抛 SOCKS_SNAPSHOT_CORRUPT 且原状态不变。
 
-1. `Open` 受 `MaxSessions` 限制，超出返回 `ErrCapacity`；`Close` 要立刻释放名额，重复 `Close` 返回 nil 不能重复计数；未知会话 ID 返回 `ErrSession`。
-2. `Greet` 的协议版本必须为 5，否则 `ErrVersion`；方法列表里必须有 0x02 用户名/密码，只有 0x00 无认证或没有任何可用方法时返回 `ErrMethod`，即使客户端同时提供了 0x00 也不许选它；重复 `Greet` 返回 `ErrState`。
-3. 握手步骤不能跳过：`Authenticate` 只能在 `greeted` 态调用，`Connect` 只能在 `authenticated` 态调用，其余状态一律 `ErrState`。
-4. 密码错误和用户不存在必须返回同一个 `ErrAuth`、同一段错误文本，不能通过报错区分账号是否存在；每次失败都要计入 `Stats` 的 `AuthFails`。
-5. 连续失败达到 `MaxAuthFailures` 后锁定 `LockoutDuration`，锁定期内即使密码正确也返回 `ErrLocked`，锁定到期后自动可以重新认证。
-6. `MaxSessionsPerUser` 限制单用户并发会话数，达到后返回 `ErrQuota`，其他用户不受影响；被拒绝的认证不能把会话变成已认证。
-7. `Connect` 的端口必须在 `AllowedPorts` 白名单内，否则返回 `ErrPort`；端口小于等于 0 或大于 65535 返回 `ErrInvalid`。
-8. 目标地址先按字面 IP 解析，域名走注入的 resolver，解析失败或没有地址返回 `ErrHost`；解析结果落在回环、私网、链路本地（包括 169.254.169.254 这类元数据地址）、未指定或组播地址时返回 `ErrAddress`。
-9. 域名必须在每次 `Connect` 时重新解析并重新校验：同一域名先解析到公网地址、之后解析到内网地址，第二次必须被拒绝，不能拿上一次的结果复用。
-10. `Transfer` 只能在 `connected` 态调用，`up`/`down` 为负返回 `ErrInvalid`；会话累计字节超过 `MaxBytesPerSession` 时返回 `ErrBudget` 并关闭该会话，之后再 `Transfer` 返回 `ErrState`；正常累加要同时反映到会话与 `Stats`。
-11. `Sweep(now)` 关闭空闲超过 `IdleTimeout` 的会话并返回关闭数量；被清理的会话再 `Transfer` 返回 `ErrState`，`Stats` 的 `Active` 同步下降。
-12. 快照要带上用户（含失败次数与锁定截止时间）、打开会话总数、上传下载字节数和认证失败总数；重启恢复后锁定继续有效、`Stats` 与重启前一致；空用户名、空 proof、空租户返回 `ErrInvalid`。
+硬约束：hello、authenticate、connect、close、restore 全程持锁，二十个线程同时用同一账号建连时成功数必须精确等于用户上限，不能多发也不能少发；在线会话、每用户累计用量与快照大小都必须有界；快照必须深拷贝并可 JSON 往返，恢复后的在线计数、剩余配额与锁定截止时间保持一致，密码不得随快照落盘。
 
-硬约束：同一会话的并发 `CONNECT` 只能有一个成功，后到的拿 `ErrState`；会话上限与单用户配额在并发下都不能被突破；任何失败的 `Connect`、`Transfer` 都不能占用名额、不能计入字节或把状态推进；重启后锁定与计数器必须和快照前一致。
-
-验收：`go test ./...` 的 15 条测试必须全过；不得修改测试、跳过或用固定输入写死；并发和重启场景自行写验证程序确认；只在本地实现，不需要真的起代理服务。
+验收：`python3 -m pytest -q tests` 的 15 条测试全部通过；不得修改测试、跳过或按固定输入写死；并发与重启恢复场景自行验证；只做本地实现。
 
 ## 运行方式
 
 ```bash
-go test ./...
+python3 -m pytest -q tests
 ```
 
 ## 平台字段
